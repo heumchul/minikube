@@ -17,47 +17,162 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
 	"os"
+	"runtime"
 	"time"
 
+	"github.com/docker/machine/libmachine"
+	"github.com/docker/machine/libmachine/mcnerror"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	cmdUtil "k8s.io/minikube/cmd/util"
-	"k8s.io/minikube/pkg/minikube/cluster"
+	"github.com/spf13/viper"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/kubeconfig"
+	"k8s.io/minikube/pkg/minikube/localpath"
 	"k8s.io/minikube/pkg/minikube/machine"
-	pkgutil "k8s.io/minikube/pkg/util"
+	"k8s.io/minikube/pkg/minikube/mustload"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/out/register"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/schedule"
+	"k8s.io/minikube/pkg/minikube/style"
+	"k8s.io/minikube/pkg/util/retry"
+)
+
+var (
+	stopAll               bool
+	keepActive            bool
+	scheduledStopDuration time.Duration
 )
 
 // stopCmd represents the stop command
 var stopCmd = &cobra.Command{
 	Use:   "stop",
-	Short: "Stops a running local kubernetes cluster",
-	Long: `Stops a local kubernetes cluster running in Virtualbox. This command stops the VM
-itself, leaving all files intact. The cluster can be started again with the "start" command.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("Stopping local Kubernetes cluster...")
-		api, err := machine.NewAPIClient()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting client: %v\n", err)
-			os.Exit(1)
-		}
-		defer api.Close()
-
-		stop := func() (err error) {
-			return cluster.StopHost(api)
-		}
-		if err := pkgutil.RetryAfter(5, stop, 1*time.Second); err != nil {
-			fmt.Println("Error stopping machine: ", err)
-			cmdUtil.MaybeReportErrorAndExit(err)
-		}
-		fmt.Println("Machine stopped.")
-
-		if err := cmdUtil.KillMountProcess(); err != nil {
-			fmt.Println("Errors occurred deleting mount process: ", err)
-		}
-	},
+	Short: "Stops a running local Kubernetes cluster",
+	Long:  `Stops a local Kubernetes cluster. This command stops the underlying VM or container, but keeps user data intact. The cluster can be started again with the "start" command.`,
+	Run:   runStop,
 }
 
 func init() {
-	RootCmd.AddCommand(stopCmd)
+	stopCmd.Flags().BoolVar(&stopAll, "all", false, "Set flag to stop all profiles (clusters)")
+	stopCmd.Flags().BoolVar(&keepActive, "keep-context-active", false, "keep the kube-context active after cluster is stopped. Defaults to false.")
+	stopCmd.Flags().DurationVar(&scheduledStopDuration, "schedule", 0*time.Second, "Set flag to stop cluster after a set amount of time (e.g. --schedule=5m)")
+	if err := stopCmd.Flags().MarkHidden("schedule"); err != nil {
+		klog.Info("unable to mark --schedule flag as hidden")
+	}
+	stopCmd.Flags().StringVarP(&outputFormat, "output", "o", "text", "Format to print stdout in. Options include: [text,json]")
+
+	if err := viper.GetViper().BindPFlags(stopCmd.Flags()); err != nil {
+		exit.Error(reason.InternalFlagsBind, "unable to bind flags", err)
+	}
+}
+
+// runStop handles the executes the flow of "minikube stop"
+func runStop(cmd *cobra.Command, args []string) {
+	out.SetJSON(outputFormat == "json")
+	register.Reg.SetStep(register.Stopping)
+
+	// check if profile path exists, if no PathError log file exists for valid profile
+	if _, err := os.Stat(localpath.Profile(ClusterFlagValue())); err == nil {
+		register.SetEventLogPath(localpath.EventLog(ClusterFlagValue()))
+	}
+
+	// new code
+	var profilesToStop []string
+	if stopAll {
+		validProfiles, _, err := config.ListProfiles()
+		if err != nil {
+			klog.Warningf("'error loading profiles in minikube home %q: %v", localpath.MiniPath(), err)
+		}
+		for _, profile := range validProfiles {
+			profilesToStop = append(profilesToStop, profile.Name)
+		}
+	} else {
+		cname := ClusterFlagValue()
+		profilesToStop = append(profilesToStop, cname)
+	}
+
+	// Kill any existing scheduled stops
+	schedule.KillExisting(profilesToStop)
+
+	if scheduledStopDuration != 0 {
+		if runtime.GOOS == "windows" {
+			exit.Message(reason.Usage, "the --schedule flag is currently not supported on windows")
+		}
+		if err := schedule.Daemonize(profilesToStop, scheduledStopDuration); err != nil {
+			exit.Message(reason.DaemonizeError, "unable to daemonize: {{.err}}", out.V{"err": err.Error()})
+		}
+		klog.Infof("sleeping %s before completing stop...", scheduledStopDuration.String())
+		time.Sleep(scheduledStopDuration)
+	}
+
+	stoppedNodes := 0
+	for _, profile := range profilesToStop {
+		stoppedNodes = stopProfile(profile)
+	}
+
+	register.Reg.SetStep(register.Done)
+	if stoppedNodes > 0 {
+		out.T(style.Stopped, `{{.count}} nodes stopped.`, out.V{"count": stoppedNodes})
+	}
+}
+
+func stopProfile(profile string) int {
+	stoppedNodes := 0
+	register.Reg.SetStep(register.Stopping)
+
+	// end new code
+	api, cc := mustload.Partial(profile)
+	defer api.Close()
+
+	for _, n := range cc.Nodes {
+		machineName := driver.MachineName(*cc, n)
+
+		nonexistent := stop(api, machineName)
+		if !nonexistent {
+			stoppedNodes++
+		}
+	}
+
+	if err := killMountProcess(); err != nil {
+		out.WarningT("Unable to kill mount process: {{.error}}", out.V{"error": err})
+	}
+
+	if !keepActive {
+		if err := kubeconfig.DeleteContext(profile, kubeconfig.PathFromEnv()); err != nil {
+			exit.Error(reason.HostKubeconfigDeleteCtx, "delete ctx", err)
+		}
+	}
+
+	return stoppedNodes
+}
+
+func stop(api libmachine.API, machineName string) bool {
+	nonexistent := false
+
+	tryStop := func() (err error) {
+		err = machine.StopHost(api, machineName)
+		if err == nil {
+			return nil
+		}
+		klog.Warningf("stop host returned error: %v", err)
+
+		switch err := errors.Cause(err).(type) {
+		case mcnerror.ErrHostDoesNotExist:
+			out.T(style.Meh, `"{{.machineName}}" does not exist, nothing to stop`, out.V{"machineName": machineName})
+			nonexistent = true
+			return nil
+		default:
+			return err
+		}
+	}
+
+	if err := retry.Expo(tryStop, 1*time.Second, 120*time.Second, 5); err != nil {
+		exit.Error(reason.GuestStopTimeout, "Unable to stop VM", err)
+	}
+
+	return nonexistent
 }

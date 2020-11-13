@@ -19,10 +19,19 @@ limitations under the License.
 package main
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/docker/machine/libmachine/drivers/plugin"
 	"k8s.io/minikube/pkg/drivers/kvm"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		fmt.Println("version:", kvm.GetVersion())
+		fmt.Println("commit:", kvm.GetGitCommitID())
+		return
+	}
+
 	plugin.RegisterDriver(kvm.NewDriver("", ""))
 }

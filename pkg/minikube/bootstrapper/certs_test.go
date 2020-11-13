@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/tests"
@@ -29,27 +30,35 @@ import (
 
 func TestSetupCerts(t *testing.T) {
 	tempDir := tests.MakeTempDir()
-	defer os.RemoveAll(tempDir)
+	defer tests.RemoveTempDir(tempDir)
 
-	f := NewFakeCommandRunner()
 	k8s := config.KubernetesConfig{
 		APIServerName: constants.APIServerName,
 		DNSDomain:     constants.ClusterDNSDomain,
-		ServiceCIDR:   util.DefaultServiceCIDR,
+		ServiceCIDR:   constants.DefaultServiceCIDR,
 	}
 
-	var filesToBeTransferred []string
-	for _, cert := range certs {
-		filesToBeTransferred = append(filesToBeTransferred, filepath.Join(constants.GetMinipath(), cert))
+	if err := os.Mkdir(filepath.Join(tempDir, "certs"), 0777); err != nil {
+		t.Fatalf("error create certificate directory: %v", err)
 	}
 
-	if err := SetupCerts(f, k8s); err != nil {
+	if err := util.GenerateCACert(
+		filepath.Join(tempDir, "certs", "mycert.pem"),
+		filepath.Join(tempDir, "certs", "mykey.pem"),
+		"Test Certificate",
+	); err != nil {
+		t.Fatalf("error generating certificate: %v", err)
+	}
+
+	expected := map[string]string{
+		`sudo /bin/bash -c "test -s /usr/share/ca-certificates/mycert.pem && ln -fs /usr/share/ca-certificates/mycert.pem /etc/ssl/certs/mycert.pem"`:             "-",
+		`sudo /bin/bash -c "test -s /usr/share/ca-certificates/minikubeCA.pem && ln -fs /usr/share/ca-certificates/minikubeCA.pem /etc/ssl/certs/minikubeCA.pem"`: "-",
+	}
+	f := command.NewFakeCommandRunner()
+	f.SetCommandToOutput(expected)
+
+	_, err := SetupCerts(f, k8s, config.Node{})
+	if err != nil {
 		t.Fatalf("Error starting cluster: %v", err)
-	}
-	for _, cert := range filesToBeTransferred {
-		_, err := f.GetFileToContents(cert)
-		if err != nil {
-			t.Errorf("Cert not generated: %s", cert)
-		}
 	}
 }

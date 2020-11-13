@@ -17,103 +17,150 @@ limitations under the License.
 package tests
 
 import (
+	"runtime"
+	"testing"
+
 	"github.com/docker/machine/libmachine/drivers"
 	"github.com/docker/machine/libmachine/mcnflag"
 	"github.com/docker/machine/libmachine/state"
 	"github.com/pkg/errors"
+	"k8s.io/minikube/pkg/minikube/constants"
+
+	"k8s.io/klog/v2"
 )
 
 // MockDriver is a struct used to mock out libmachine.Driver
 type MockDriver struct {
 	drivers.BaseDriver
-	CurrentState state.State
-	RemoveError  bool
-	HostError    bool
-	Port         int
-	IP           string
+	CurrentState  state.State
+	RemoveError   bool
+	NotExistError bool
+	HostError     bool
+	Port          int
+	IP            string
+	T             *testing.T
+}
+
+// Logf logs mock interactions
+func (d *MockDriver) Logf(format string, args ...interface{}) {
+	if d.T == nil {
+		klog.Infof(format, args...)
+		return
+	}
+	d.T.Logf(format, args...)
 }
 
 // Create creates a MockDriver instance
-func (driver *MockDriver) Create() error {
-	driver.CurrentState = state.Running
+func (d *MockDriver) Create() error {
+	d.Logf("MockDriver.Create")
+	if d.NotExistError {
+		d.Logf("MockDriver.Create but machine does not exist")
+		d.CurrentState = state.Error
+		return nil
+	}
+	d.CurrentState = state.Running
 	return nil
 }
 
-func (driver *MockDriver) GetIP() (string, error) {
-	if driver.IP != "" {
-		return driver.IP, nil
+// GetIP returns the IP address
+func (d *MockDriver) GetIP() (string, error) {
+	d.Logf("MockDriver.GetIP")
+	if d.IP != "" {
+		return d.IP, nil
 	}
-	if driver.BaseDriver.IPAddress != "" {
-		return driver.BaseDriver.IPAddress, nil
+	if d.BaseDriver.IPAddress != "" {
+		return d.BaseDriver.IPAddress, nil
 	}
 	return "127.0.0.1", nil
 }
 
 // GetCreateFlags returns the flags used to create a MockDriver
-func (driver *MockDriver) GetCreateFlags() []mcnflag.Flag {
+func (d *MockDriver) GetCreateFlags() []mcnflag.Flag {
 	return []mcnflag.Flag{}
 }
 
-func (driver *MockDriver) GetSSHPort() (int, error) {
-	return driver.Port, nil
+// GetSSHPort returns the SSH port
+func (d *MockDriver) GetSSHPort() (int, error) {
+	return d.Port, nil
 }
 
 // GetSSHHostname returns the hostname for SSH
-func (driver *MockDriver) GetSSHHostname() (string, error) {
-	if driver.HostError {
+func (d *MockDriver) GetSSHHostname() (string, error) {
+	if d.HostError {
 		return "", errors.New("error getting host")
 	}
 	return "localhost", nil
 }
 
-// GetSSHHostname returns the hostname for SSH
-func (driver *MockDriver) GetSSHKeyPath() string {
-	return driver.BaseDriver.SSHKeyPath
+// GetSSHKeyPath returns the key path for SSH
+func (d *MockDriver) GetSSHKeyPath() string {
+	return d.BaseDriver.SSHKeyPath
 }
 
 // GetState returns the state of the driver
-func (driver *MockDriver) GetState() (state.State, error) {
-	return driver.CurrentState, nil
+func (d *MockDriver) GetState() (state.State, error) {
+	_, file, no, _ := runtime.Caller(2)
+	d.Logf("MockDriver.GetState called from %s#%d: returning %q", file, no, d.CurrentState)
+
+	// NOTE: this logic is questionable
+	if d.NotExistError && d.CurrentState != state.Stopped && d.CurrentState != state.None {
+		d.CurrentState = state.Error
+		d.Logf("mock NotExistError set, setting state=%s err=%v", d.CurrentState, constants.ErrMachineMissing)
+		return d.CurrentState, constants.ErrMachineMissing
+	}
+	return d.CurrentState, nil
 }
 
 // GetURL returns the URL of the driver
-func (driver *MockDriver) GetURL() (string, error) {
+func (d *MockDriver) GetURL() (string, error) {
 	return "", nil
 }
 
 // Kill kills the machine
-func (driver *MockDriver) Kill() error {
-	driver.CurrentState = state.Stopped
+func (d *MockDriver) Kill() error {
+	d.Logf("MockDriver.Kill")
+	d.CurrentState = state.Stopped
 	return nil
 }
 
 // Remove removes the machine
-func (driver *MockDriver) Remove() error {
-	if driver.RemoveError {
+func (d *MockDriver) Remove() error {
+	d.Logf("MockDriver.Remove")
+	if d.RemoveError {
 		return errors.New("error deleting machine")
 	}
+	d.NotExistError = false
 	return nil
 }
 
 // Restart restarts the machine
-func (driver *MockDriver) Restart() error {
-	driver.CurrentState = state.Running
+func (d *MockDriver) Restart() error {
+	d.Logf("MockDriver.Restart, setting CurrentState=%s", state.Running)
+	d.CurrentState = state.Running
 	return nil
 }
 
 // SetConfigFromFlags sets the machine config
-func (driver *MockDriver) SetConfigFromFlags(opts drivers.DriverOptions) error {
+func (d *MockDriver) SetConfigFromFlags(opts drivers.DriverOptions) error {
 	return nil
 }
 
 // Start starts the machine
-func (driver *MockDriver) Start() error {
-	driver.CurrentState = state.Running
+func (d *MockDriver) Start() error {
+	d.Logf("MockDriver.Start")
+	d.CurrentState = state.Running
 	return nil
 }
 
 // Stop stops the machine
-func (driver *MockDriver) Stop() error {
-	driver.CurrentState = state.Stopped
+func (d *MockDriver) Stop() error {
+	d.Logf("MockDriver.Stop")
+	d.CurrentState = state.Stopped
 	return nil
+}
+
+// DriverName returns the name of the driver
+func (d *MockDriver) DriverName() string {
+	d.Logf("MockDriver.Name")
+	return "mock"
 }

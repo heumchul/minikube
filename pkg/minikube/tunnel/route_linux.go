@@ -22,7 +22,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 func (router *osRouter) EnsureRouteIsAdded(route *Route) error {
@@ -37,17 +37,17 @@ func (router *osRouter) EnsureRouteIsAdded(route *Route) error {
 	serviceCIDR := route.DestCIDR.String()
 	gatewayIP := route.Gateway.String()
 
-	glog.Infof("Adding route for CIDR %s to gateway %s", serviceCIDR, gatewayIP)
+	klog.Infof("Adding route for CIDR %s to gateway %s", serviceCIDR, gatewayIP)
 	command := exec.Command("sudo", "ip", "route", "add", serviceCIDR, "via", gatewayIP)
-	glog.Infof("About to run command: %s", command.Args)
+	klog.Infof("About to run command: %s", command.Args)
 	stdInAndOut, err := command.CombinedOutput()
 	message := string(stdInAndOut)
 	if len(message) > 0 {
 		return fmt.Errorf("error adding Route: %s, %d", message, len(strings.Split(message, "\n")))
 	}
-	glog.Info(stdInAndOut)
+	klog.Info(stdInAndOut)
 	if err != nil {
-		glog.Errorf("error adding Route: %s, %d", message, len(strings.Split(message, "\n")))
+		klog.Errorf("error adding Route: %s, %d", message, len(strings.Split(message, "\n")))
 		return err
 	}
 	return nil
@@ -74,7 +74,7 @@ func (router *osRouter) parseTable(table []byte) routingTable {
 
 		fields := strings.Fields(line)
 
-		//don't care about the routes that 0.0.0.0
+		// don't care about the routes that 0.0.0.0
 		if len(fields) == 0 ||
 			len(fields) > 0 && (fields[0] == "default" || fields[0] == "0.0.0.0") {
 			continue
@@ -82,12 +82,12 @@ func (router *osRouter) parseTable(table []byte) routingTable {
 
 		if len(fields) > 2 {
 
-			//assuming "10.96.0.0/12 via 192.168.39.47 dev virbr1"
+			// assuming "10.96.0.0/12 via 192.168.39.47 dev virbr1"
 			dstCIDRString := fields[0]
 			gatewayIPString := fields[2]
 			gatewayIP := net.ParseIP(gatewayIPString)
 
-			//if not via format, then gateway is assumed to be 0.0.0.0
+			// if not via format, then gateway is assumed to be 0.0.0.0
 			// "1.2.3.0/24 dev eno1 proto kernel scope link src 1.2.3.54 metric 100"
 			if fields[1] != "via" {
 				gatewayIP = net.ParseIP("0.0.0.0")
@@ -95,9 +95,9 @@ func (router *osRouter) parseTable(table []byte) routingTable {
 
 			_, ipNet, err := net.ParseCIDR(dstCIDRString)
 			if err != nil {
-				glog.V(4).Infof("skipping line: can't parse CIDR from routing table: %s", dstCIDRString)
+				klog.V(4).Infof("skipping line: can't parse CIDR from routing table: %s", dstCIDRString)
 			} else if gatewayIP == nil {
-				glog.V(4).Infof("skipping line: can't parse IP from routing table: %s", gatewayIPString)
+				klog.V(4).Infof("skipping line: can't parse IP from routing table: %s", gatewayIPString)
 			} else {
 
 				tableLine := routingTableLine{
@@ -126,11 +126,11 @@ func (router *osRouter) Cleanup(route *Route) error {
 	serviceCIDR := route.DestCIDR.String()
 	gatewayIP := route.Gateway.String()
 
-	glog.Infof("Cleaning up route for CIDR %s to gateway %s\n", serviceCIDR, gatewayIP)
+	klog.Infof("Cleaning up route for CIDR %s to gateway %s\n", serviceCIDR, gatewayIP)
 	command := exec.Command("sudo", "ip", "route", "delete", serviceCIDR)
 	stdInAndOut, err := command.CombinedOutput()
 	message := fmt.Sprintf("%s", stdInAndOut)
-	glog.Infof("%s", message)
+	klog.Infof("%s", message)
 	if err != nil {
 		return fmt.Errorf("error deleting Route: %s, %s", message, err)
 	}

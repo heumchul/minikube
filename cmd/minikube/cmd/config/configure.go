@@ -17,22 +17,26 @@ limitations under the License.
 package config
 
 import (
-	"fmt"
 	"io/ioutil"
-	"os"
+	"net"
 
 	"github.com/spf13/cobra"
+	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/mustload"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 	"k8s.io/minikube/pkg/minikube/service"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 var addonsConfigureCmd = &cobra.Command{
 	Use:   "configure ADDON_NAME",
-	Short: "Configures the addon w/ADDON_NAME within minikube (example: minikube addons configure registry-creds). For a list of available addons use: minikube addons list ",
-	Long:  "Configures the addon w/ADDON_NAME within minikube (example: minikube addons configure registry-creds). For a list of available addons use: minikube addons list ",
+	Short: "Configures the addon w/ADDON_NAME within minikube (example: minikube addons configure registry-creds). For a list of available addons use: minikube addons list",
+	Long:  "Configures the addon w/ADDON_NAME within minikube (example: minikube addons configure registry-creds). For a list of available addons use: minikube addons list",
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) != 1 {
-			fmt.Fprintln(os.Stderr, "usage: minikube addons configure ADDON_NAME")
-			os.Exit(1)
+			exit.Message(reason.Usage, "usage: minikube addons configure ADDON_NAME")
 		}
 
 		addon := args[0]
@@ -54,6 +58,9 @@ var addonsConfigureCmd = &cobra.Command{
 			dockerUser := "changeme"
 			dockerPass := "changeme"
 			gcrURL := "https://gcr.io"
+			acrURL := "changeme"
+			acrClientID := "changeme"
+			acrPassword := "changeme"
 
 			enableAWSECR := AskForYesNoConfirmation("\nDo you want to enable AWS Elastic Container Registry?", posResponses, negResponses)
 			if enableAWSECR {
@@ -78,7 +85,7 @@ var addonsConfigureCmd = &cobra.Command{
 				dat, err := ioutil.ReadFile(gcrPath)
 
 				if err != nil {
-					fmt.Println("Could not read file for application_default_credentials.json")
+					out.FailureT("Error reading {{.path}}: {{.error}}", out.V{"path": gcrPath, "error": err})
 				} else {
 					gcrApplicationDefaultCredentials = string(dat)
 				}
@@ -91,8 +98,18 @@ var addonsConfigureCmd = &cobra.Command{
 				dockerPass = AskForPasswordValue("-- Enter docker registry password: ")
 			}
 
+			enableACR := AskForYesNoConfirmation("\nDo you want to enable Azure Container Registry?", posResponses, negResponses)
+			if enableACR {
+				acrURL = AskForStaticValue("-- Enter Azure Container Registry (ACR) URL: ")
+				acrClientID = AskForStaticValue("-- Enter client ID (service principal ID) to access ACR: ")
+				acrPassword = AskForPasswordValue("-- Enter service principal password to access Azure Container Registry: ")
+			}
+
+			cname := ClusterFlagValue()
+
 			// Create ECR Secret
 			err := service.CreateSecret(
+				cname,
 				"kube-system",
 				"registry-creds-ecr",
 				map[string]string{
@@ -108,13 +125,13 @@ var addonsConfigureCmd = &cobra.Command{
 					"cloud":                         "ecr",
 					"kubernetes.io/minikube-addons": "registry-creds",
 				})
-
 			if err != nil {
-				fmt.Println("ERROR creating `registry-creds-ecr` secret")
+				out.FailureT("ERROR creating `registry-creds-ecr` secret: {{.error}}", out.V{"error": err})
 			}
 
 			// Create GCR Secret
 			err = service.CreateSecret(
+				cname,
 				"kube-system",
 				"registry-creds-gcr",
 				map[string]string{
@@ -128,11 +145,12 @@ var addonsConfigureCmd = &cobra.Command{
 				})
 
 			if err != nil {
-				fmt.Println("ERROR creating `registry-creds-gcr` secret")
+				out.FailureT("ERROR creating `registry-creds-gcr` secret: {{.error}}", out.V{"error": err})
 			}
 
 			// Create Docker Secret
 			err = service.CreateSecret(
+				cname,
 				"kube-system",
 				"registry-creds-dpr",
 				map[string]string{
@@ -147,16 +165,55 @@ var addonsConfigureCmd = &cobra.Command{
 				})
 
 			if err != nil {
-				fmt.Println("ERROR creating `registry-creds-dpr` secret")
+				out.WarningT("ERROR creating `registry-creds-dpr` secret")
 			}
 
-			break
+			// Create Azure Container Registry Secret
+			err = service.CreateSecret(
+				cname,
+				"kube-system",
+				"registry-creds-acr",
+				map[string]string{
+					"ACR_URL":       acrURL,
+					"ACR_CLIENT_ID": acrClientID,
+					"ACR_PASSWORD":  acrPassword,
+				},
+				map[string]string{
+					"app":                           "registry-creds",
+					"cloud":                         "acr",
+					"kubernetes.io/minikube-addons": "registry-creds",
+				})
+
+			if err != nil {
+				out.WarningT("ERROR creating `registry-creds-acr` secret")
+			}
+
+		case "metallb":
+			profile := ClusterFlagValue()
+			_, cfg := mustload.Partial(profile)
+
+			validator := func(s string) bool {
+				return net.ParseIP(s) != nil
+			}
+
+			if cfg.KubernetesConfig.LoadBalancerStartIP == "" {
+				cfg.KubernetesConfig.LoadBalancerStartIP = AskForStaticValidatedValue("-- Enter Load Balancer Start IP: ", validator)
+			}
+
+			if cfg.KubernetesConfig.LoadBalancerEndIP == "" {
+				cfg.KubernetesConfig.LoadBalancerEndIP = AskForStaticValidatedValue("-- Enter Load Balancer End IP: ", validator)
+			}
+
+			if err := config.SaveProfile(profile, cfg); err != nil {
+				out.ErrT(style.Fatal, "Failed to save config {{.profile}}", out.V{"profile": profile})
+			}
+
 		default:
-			fmt.Fprintln(os.Stdout, fmt.Sprintf("%s has no available configuration options", addon))
+			out.FailureT("{{.name}} has no available configuration options", out.V{"name": addon})
 			return
 		}
 
-		fmt.Fprintln(os.Stdout, fmt.Sprintf("%s was successfully configured", addon))
+		out.SuccessT("{{.name}} was successfully configured", out.V{"name": addon})
 	},
 }
 

@@ -36,29 +36,35 @@ import (
 	"github.com/docker/machine/libmachine/host"
 	"github.com/docker/machine/libmachine/mcnutils"
 	"github.com/docker/machine/libmachine/persist"
-	"github.com/docker/machine/libmachine/ssh"
+	lmssh "github.com/docker/machine/libmachine/ssh"
 	"github.com/docker/machine/libmachine/state"
 	"github.com/docker/machine/libmachine/swarm"
 	"github.com/docker/machine/libmachine/version"
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
-	"k8s.io/minikube/pkg/minikube/bootstrapper"
-	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/minikube/command"
+	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/localpath"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 	"k8s.io/minikube/pkg/minikube/registry"
-	"k8s.io/minikube/pkg/minikube/sshutil"
-	"k8s.io/minikube/pkg/provision"
 )
 
+// NewRPCClient gets a new client.
 func NewRPCClient(storePath, certsDir string) libmachine.API {
 	c := libmachine.NewClient(storePath, certsDir)
-	c.SSHClientType = ssh.Native
+	c.SSHClientType = lmssh.Native
 	return c
 }
 
 // NewAPIClient gets a new client.
-func NewAPIClient() (libmachine.API, error) {
-	storePath := constants.GetMinipath()
-	certsDir := constants.MakeMiniPath("certs")
+func NewAPIClient(miniHome ...string) (libmachine.API, error) {
+	storePath := localpath.MiniPath()
+	if len(miniHome) > 0 {
+		storePath = miniHome[0]
+	}
+	certsDir := localpath.MakeMiniPath("certs")
 
 	return &LocalClient{
 		certsDir:     certsDir,
@@ -77,27 +83,26 @@ type LocalClient struct {
 	legacyClient libmachine.API
 }
 
-func (api *LocalClient) NewHost(driverName string, rawDriver []byte) (*host.Host, error) {
-	var def registry.DriverDef
-	var err error
-	if def, err = registry.Driver(driverName); err != nil {
-		return nil, err
-	} else if !def.Builtin || def.DriverCreator == nil {
-		return api.legacyClient.NewHost(driverName, rawDriver)
+// NewHost creates a new Host
+func (api *LocalClient) NewHost(drvName string, rawDriver []byte) (*host.Host, error) {
+	def := registry.Driver(drvName)
+	if def.Empty() {
+		return nil, fmt.Errorf("driver %q does not exist", drvName)
 	}
-
-	driver := def.DriverCreator()
-
-	err = json.Unmarshal(rawDriver, driver)
+	if def.Init == nil {
+		return api.legacyClient.NewHost(drvName, rawDriver)
+	}
+	d := def.Init()
+	err := json.Unmarshal(rawDriver, d)
 	if err != nil {
 		return nil, errors.Wrapf(err, "Error getting driver %s", string(rawDriver))
 	}
 
 	return &host.Host{
 		ConfigVersion: version.ConfigVersion,
-		Name:          driver.GetMachineName(),
-		Driver:        driver,
-		DriverName:    driver.DriverName(),
+		Name:          d.GetMachineName(),
+		Driver:        d,
+		DriverName:    d.DriverName(),
 		HostOptions: &host.Options{
 			AuthOptions: &auth.Options{
 				CertDir:          api.certsDir,
@@ -117,23 +122,25 @@ func (api *LocalClient) NewHost(driverName string, rawDriver []byte) (*host.Host
 	}, nil
 }
 
+// Load a new client, creating driver
 func (api *LocalClient) Load(name string) (*host.Host, error) {
 	h, err := api.Filestore.Load(name)
 	if err != nil {
-		return nil, errors.Wrap(err, "Error loading host from store")
+		return nil, errors.Wrapf(err, "filestore %q", name)
 	}
 
-	var def registry.DriverDef
-	if def, err = registry.Driver(h.DriverName); err != nil {
-		return nil, err
-	} else if !def.Builtin || def.DriverCreator == nil {
+	def := registry.Driver(h.DriverName)
+	if def.Empty() {
+		return nil, fmt.Errorf("driver %q does not exist", h.DriverName)
+	}
+	if def.Init == nil {
 		return api.legacyClient.Load(name)
 	}
-
-	h.Driver = def.DriverCreator()
+	h.Driver = def.Init()
 	return h, json.Unmarshal(h.RawDriver, h.Driver)
 }
 
+// Close closes the client
 func (api *LocalClient) Close() error {
 	if api.legacyClient != nil {
 		return api.legacyClient.Close()
@@ -142,21 +149,31 @@ func (api *LocalClient) Close() error {
 }
 
 // CommandRunner returns best available command runner for this host
-func CommandRunner(h *host.Host) (bootstrapper.CommandRunner, error) {
-	if h.DriverName == constants.DriverNone {
-		return &bootstrapper.ExecRunner{}, nil
+func CommandRunner(h *host.Host) (command.Runner, error) {
+	if h.DriverName == driver.Mock {
+		return &command.FakeCommandRunner{}, nil
 	}
-	client, err := sshutil.NewSSHClient(h.Driver)
-	if err != nil {
-		return nil, errors.Wrap(err, "getting ssh client for bootstrapper")
+	if driver.BareMetal(h.Driver.DriverName()) {
+		return command.NewExecRunner(), nil
 	}
-	return bootstrapper.NewSSHRunner(client), nil
+
+	return command.NewSSHRunner(h.Driver), nil
 }
 
+// Create creates the host
 func (api *LocalClient) Create(h *host.Host) error {
-	if def, err := registry.Driver(h.DriverName); err != nil {
-		return err
-	} else if !def.Builtin || def.DriverCreator == nil {
+	klog.Infof("LocalClient.Create starting")
+	start := time.Now()
+	defer func() {
+		klog.Infof("LocalClient.Create took %s", time.Since(start))
+	}()
+
+	def := registry.Driver(h.DriverName)
+	if def.Empty() {
+		return fmt.Errorf("driver %q does not exist", h.DriverName)
+	}
+	if def.Init == nil {
+		// NOTE: This will call provision.DetectProvisioner
 		return api.legacyClient.Create(h)
 	}
 
@@ -165,53 +182,54 @@ func (api *LocalClient) Create(h *host.Host) error {
 		f    func() error
 	}{
 		{
-			"Bootstrapping certs.",
+			"bootstrapping certificates",
 			func() error { return cert.BootstrapCertificates(h.AuthOptions()) },
 		},
 		{
-			"Running precreate checks.",
+			"precreate",
 			h.Driver.PreCreateCheck,
 		},
 		{
-			"Saving driver.",
+			"saving",
 			func() error {
 				return api.Save(h)
 			},
 		},
 		{
-			"Creating VM.",
+			"creating",
 			h.Driver.Create,
 		},
 		{
-			"Waiting for VM to start.",
+			"waiting",
 			func() error {
-				if h.Driver.DriverName() == "none" {
+				if driver.BareMetal(h.Driver.DriverName()) {
 					return nil
 				}
 				return mcnutils.WaitFor(drivers.MachineInState(h.Driver, state.Running))
 			},
 		},
 		{
-			"Provisioning VM.",
+			"provisioning",
 			func() error {
-				if h.Driver.DriverName() == "none" {
+				// Skippable because we don't reconfigure Docker?
+				if driver.BareMetal(h.Driver.DriverName()) {
 					return nil
 				}
-				pv := provision.NewBuildrootProvisioner(h.Driver)
-				return pv.Provision(*h.HostOptions.SwarmOptions, *h.HostOptions.AuthOptions, *h.HostOptions.EngineOptions)
+				return provisionDockerMachine(h)
 			},
 		},
 	}
 
 	for _, step := range steps {
 		if err := step.f(); err != nil {
-			return errors.Wrap(err, fmt.Sprintf("Error executing step: %s\n", step.name))
+			return errors.Wrap(err, step.name)
 		}
 	}
 
 	return nil
 }
 
+// StartDriver starts the driver
 func StartDriver() {
 	cert.SetCertGenerator(&CertGenerator{})
 	check.DefaultConnChecker = &ConnChecker{}
@@ -222,9 +240,11 @@ func StartDriver() {
 	localbinary.CurrentBinaryIsDockerMachine = true
 }
 
+// ConnChecker can check the connection
 type ConnChecker struct {
 }
 
+// Check checks the connection
 func (cc *ConnChecker) Check(h *host.Host, swarm bool) (string, *auth.Options, error) {
 	authOptions := h.AuthOptions()
 	dockerHost, err := h.Driver.GetURL()
@@ -258,11 +278,10 @@ func (cg *CertGenerator) ValidateCertificate(addr string, authOptions *auth.Opti
 	return true, nil
 }
 
-func registerDriver(driverName string) {
-	def, err := registry.Driver(driverName)
-	if err != nil {
-		glog.Exitf("Unsupported driver: %s\n", driverName)
+func registerDriver(drvName string) {
+	def := registry.Driver(drvName)
+	if def.Empty() {
+		exit.Message(reason.Usage, "unsupported or missing driver: {{.name}}", out.V{"name": drvName})
 	}
-
-	plugin.RegisterDriver(def.DriverCreator())
+	plugin.RegisterDriver(def.Init())
 }

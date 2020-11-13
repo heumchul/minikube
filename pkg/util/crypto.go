@@ -31,8 +31,11 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/util/lock"
 )
 
+// GenerateCACert generates a CA certificate and RSA key for a common name
 func GenerateCACert(certPath, keyPath string, name string) error {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -60,14 +63,17 @@ func GenerateCACert(certPath, keyPath string, name string) error {
 // The certificate will be created with file mode 0644. The key will be created with file mode 0600.
 // If the certificate or key files already exist, they will be overwritten.
 // Any parent directories of the certPath or keyPath will be created as needed with file mode 0755.
+
+// GenerateSignedCert generates a signed certificate and key
 func GenerateSignedCert(certPath, keyPath, cn string, ips []net.IP, alternateDNS []string, signerCertPath, signerKeyPath string) error {
+	klog.Infof("Generating cert %s with IP's: %s", certPath, ips)
 	signerCertBytes, err := ioutil.ReadFile(signerCertPath)
 	if err != nil {
 		return errors.Wrap(err, "Error reading file: signerCertPath")
 	}
 	decodedSignerCert, _ := pem.Decode(signerCertBytes)
 	if decodedSignerCert == nil {
-		return errors.New("Unable to decode certificate.")
+		return errors.New("Unable to decode certificate")
 	}
 	signerCert, err := x509.ParseCertificate(decodedSignerCert.Bytes)
 	if err != nil {
@@ -79,11 +85,11 @@ func GenerateSignedCert(certPath, keyPath, cn string, ips []net.IP, alternateDNS
 	}
 	decodedSignerKey, _ := pem.Decode(signerKeyBytes)
 	if decodedSignerKey == nil {
-		return errors.New("Unable to decode key.")
+		return errors.New("Unable to decode key")
 	}
 	signerKey, err := x509.ParsePKCS1PrivateKey(decodedSignerKey.Bytes)
 	if err != nil {
-		return errors.Wrap(err, "Error parsing prive key: decodedSignerKey.Bytes")
+		return errors.Wrap(err, "Error parsing private key: decodedSignerKey.Bytes")
 	}
 
 	template := x509.Certificate{
@@ -148,14 +154,16 @@ func writeCertsAndKeys(template *x509.Certificate, certPath string, signeeKey *r
 	if err := os.MkdirAll(filepath.Dir(certPath), os.FileMode(0755)); err != nil {
 		return errors.Wrap(err, "Error creating certificate directory")
 	}
-	if err := ioutil.WriteFile(certPath, certBuffer.Bytes(), os.FileMode(0644)); err != nil {
+	klog.Infof("Writing cert to %s ...", certPath)
+	if err := lock.WriteFile(certPath, certBuffer.Bytes(), os.FileMode(0644)); err != nil {
 		return errors.Wrap(err, "Error writing certificate to cert path")
 	}
 
 	if err := os.MkdirAll(filepath.Dir(keyPath), os.FileMode(0755)); err != nil {
 		return errors.Wrap(err, "Error creating key directory")
 	}
-	if err := ioutil.WriteFile(keyPath, keyBuffer.Bytes(), os.FileMode(0600)); err != nil {
+	klog.Infof("Writing key to %s ...", keyPath)
+	if err := lock.WriteFile(keyPath, keyBuffer.Bytes(), os.FileMode(0600)); err != nil {
 		return errors.Wrap(err, "Error writing key file")
 	}
 

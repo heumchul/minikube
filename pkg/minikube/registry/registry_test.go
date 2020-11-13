@@ -19,61 +19,47 @@ package registry
 import (
 	"testing"
 
-	"k8s.io/minikube/pkg/minikube/config"
+	"github.com/google/go-cmp/cmp"
 )
 
-func TestRegistry(t *testing.T) {
-	foo := DriverDef{
-		Name:    "foo",
-		Builtin: true,
-		ConfigCreator: func(_ config.MachineConfig) interface{} {
-			return nil
-		},
+func TestRegister(t *testing.T) {
+	r := newRegistry()
+	foo := DriverDef{Name: "foo"}
+	if err := r.Register(foo); err != nil {
+		t.Errorf("Register = %v, expected nil", err)
 	}
-	bar := DriverDef{
-		Name:    "bar",
-		Builtin: true,
-		ConfigCreator: func(_ config.MachineConfig) interface{} {
-			return nil
-		},
+	if err := r.Register(foo); err == nil {
+		t.Errorf("Register = nil, expected duplicate err")
+	}
+}
+
+func TestDriver(t *testing.T) {
+	foo := DriverDef{Name: "foo"}
+	r := newRegistry()
+
+	if err := r.Register(foo); err != nil {
+		t.Errorf("Register = %v, expected nil", err)
 	}
 
-	registry := createRegistry()
-
-	err := registry.Register(foo)
-	if err != nil {
-		t.Fatal("expect nil")
+	d := r.Driver("foo")
+	if d.Empty() {
+		t.Errorf("driver.Empty = true, expected false")
 	}
 
-	err = registry.Register(foo)
-	if err != ErrDriverNameExist {
-		t.Fatal("expect ErrDriverNameExist")
+	d = r.Driver("bar")
+	if !d.Empty() {
+		t.Errorf("driver.Empty = false, expected true")
+	}
+}
+
+func TestList(t *testing.T) {
+	foo := DriverDef{Name: "foo"}
+	r := newRegistry()
+	if err := r.Register(foo); err != nil {
+		t.Errorf("register returned error: %v", err)
 	}
 
-	err = registry.Register(bar)
-	if err != nil {
-		t.Fatal("expect nil")
-	}
-
-	list := registry.List()
-	if len(list) != 2 {
-		t.Fatalf("expect len(list) to be %d; got %d", 2, len(list))
-	}
-
-	if !(list[0].Name == "bar" && list[1].Name == "foo" || list[0].Name == "foo" && list[1].Name == "bar") {
-		t.Fatalf("expect registry.List return %s; got %s", []string{"bar", "foo"}, list)
-	}
-
-	driver, err := registry.Driver("foo")
-	if err != nil {
-		t.Fatal("expect nil")
-	}
-	if driver.Name != "foo" {
-		t.Fatal("expect registry.Driver(foo) returns registered driver")
-	}
-
-	driver, err = registry.Driver("foo2")
-	if err != ErrDriverNotFound {
-		t.Fatal("expect ErrDriverNotFound")
+	if diff := cmp.Diff(r.List(), []DriverDef{foo}); diff != "" {
+		t.Errorf("list mismatch (-want +got):\n%s", diff)
 	}
 }

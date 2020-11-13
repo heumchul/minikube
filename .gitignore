@@ -4,6 +4,7 @@
 *.so
 
 # Folders
+.cache
 _obj
 _test
 
@@ -31,7 +32,10 @@ _testmain.go
 #iso version file
 deploy/iso/minikube-iso/board/coreos/minikube/rootfs-overlay/etc/VERSION
 
+/pkg/minikube/assets/assets.go-e
 /pkg/minikube/assets/assets.go
+/pkg/minikube/translate/translations.go
+/pkg/minikube/translate/translations.go-e
 /minikube
 
 .DS_Store
@@ -39,3 +43,11 @@ deploy/iso/minikube-iso/board/coreos/minikube/rootfs-overlay/etc/VERSION
 /.idea
 
 /.vscode
+
+test/integration/testdata/minikube-linux-amd64-latest-stable
+
+# hugo
+/public
+/site/resources
+/_gen
+

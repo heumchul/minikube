@@ -17,139 +17,248 @@ limitations under the License.
 package cmd
 
 import (
-	goflag "flag"
+	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
-	"github.com/docker/machine/libmachine"
-	"github.com/docker/machine/libmachine/log"
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"k8s.io/klog/v2"
+	"k8s.io/kubectl/pkg/util/templates"
 	configCmd "k8s.io/minikube/cmd/minikube/cmd/config"
-	"k8s.io/minikube/cmd/util"
-	"k8s.io/minikube/pkg/minikube/bootstrapper"
-	"k8s.io/minikube/pkg/minikube/bootstrapper/kubeadm"
+	"k8s.io/minikube/pkg/drivers/kic/oci"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
-	"k8s.io/minikube/pkg/minikube/notify"
+	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/localpath"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/translate"
 )
 
 var dirs = [...]string{
-	constants.GetMinipath(),
-	constants.MakeMiniPath("certs"),
-	constants.MakeMiniPath("machines"),
-	constants.MakeMiniPath("cache"),
-	constants.MakeMiniPath("cache", "iso"),
-	constants.MakeMiniPath("config"),
-	constants.MakeMiniPath("addons"),
-	constants.MakeMiniPath("files"),
-	constants.MakeMiniPath("logs"),
-}
-
-var (
-	enableUpdateNotification = true
-)
-
-var viperWhiteList = []string{
-	"v",
-	"alsologtostderr",
-	"log_dir",
+	localpath.MiniPath(),
+	localpath.MakeMiniPath("certs"),
+	localpath.MakeMiniPath("machines"),
+	localpath.MakeMiniPath("cache"),
+	localpath.MakeMiniPath("cache", "iso"),
+	localpath.MakeMiniPath("config"),
+	localpath.MakeMiniPath("addons"),
+	localpath.MakeMiniPath("files"),
+	localpath.MakeMiniPath("logs"),
 }
 
 // RootCmd represents the base command when called without any subcommands
 var RootCmd = &cobra.Command{
 	Use:   "minikube",
-	Short: "Minikube is a tool for managing local Kubernetes clusters.",
-	Long:  `Minikube is a CLI tool that provisions and manages single-node Kubernetes clusters optimized for development workflows.`,
+	Short: "minikube quickly sets up a local Kubernetes cluster",
+	Long:  `minikube provisions and manages local Kubernetes clusters optimized for development workflows.`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		for _, path := range dirs {
-			if err := os.MkdirAll(path, 0777); err != nil {
-				glog.Exitf("Error creating minikube directory: %v", err)
+			if err := os.MkdirAll(path, 0o777); err != nil {
+				exit.Error(reason.HostHomeMkdir, "Error creating minikube directory", err)
 			}
 		}
-
-		// Log level 3 or greater enables libmachine logs
-		if !glog.V(3) {
-			log.SetOutWriter(ioutil.Discard)
-			log.SetErrWriter(ioutil.Discard)
-		}
-
-		// Log level 7 or greater enables debug level logs
-		if glog.V(7) {
-			log.SetDebug(true)
-		}
-
-		logDir := pflag.Lookup("log_dir")
-		if !logDir.Changed {
-			logDir.Value.Set(constants.MakeMiniPath("logs"))
-		}
-
-		if enableUpdateNotification {
-			notify.MaybePrintUpdateTextFromGithub(os.Stderr)
-		}
-		util.MaybePrintKubectlDownloadMsg(runtime.GOOS, os.Stderr)
 	},
 }
 
 // Execute adds all child commands to the root command sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
+	_, callingCmd := filepath.Split(os.Args[0])
+
+	if callingCmd == "kubectl" {
+		// If the user is using the minikube binary as kubectl, allow them to specify the kubectl context without also specifying minikube profile
+		profile := ""
+		for i, a := range os.Args {
+			if a == "--context" {
+				profile = fmt.Sprintf("--profile=%s", os.Args[i+1])
+				break
+			} else if strings.HasPrefix(a, "--context=") {
+				context := strings.Split(a, "=")[1]
+				profile = fmt.Sprintf("--profile=%s", context)
+				break
+			}
+		}
+		if profile != "" {
+			os.Args = append([]string{RootCmd.Use, callingCmd, profile, "--"}, os.Args[1:]...)
+		} else {
+			os.Args = append([]string{RootCmd.Use, callingCmd, "--"}, os.Args[1:]...)
+		}
+	}
+	for _, c := range RootCmd.Commands() {
+		c.Short = translate.T(c.Short)
+		c.Long = translate.T(c.Long)
+		c.Flags().VisitAll(func(f *pflag.Flag) {
+			f.Usage = translate.T(f.Usage)
+		})
+
+		c.SetUsageTemplate(usageTemplate())
+	}
+	RootCmd.Short = translate.T(RootCmd.Short)
+	RootCmd.Long = translate.T(RootCmd.Long)
+	RootCmd.Flags().VisitAll(func(f *pflag.Flag) {
+		f.Usage = translate.T(f.Usage)
+	})
+
+	if runtime.GOOS != "windows" {
+		// add minikube binaries to the path
+		targetDir := localpath.MakeMiniPath("bin")
+		addToPath(targetDir)
+	}
+
+	// Universally ensure that we never speak to the wrong DOCKER_HOST
+	if err := oci.PointToHostDockerDaemon(); err != nil {
+		klog.Errorf("oci env: %v", err)
+	}
+
+	if err := oci.PointToHostPodman(); err != nil {
+		klog.Errorf("oci env: %v", err)
+	}
+
 	if err := RootCmd.Execute(); err != nil {
-		os.Exit(1)
+		// Cobra already outputs the error, typically because the user provided an unknown command.
+		os.Exit(reason.ExProgramUsage)
 	}
 }
 
-// Handle config values for flags used in external packages (e.g. glog)
-// by setting them directly, using values from viper when not passed in as args
-func setFlagsUsingViper() {
-	for _, config := range viperWhiteList {
-		var a = pflag.Lookup(config)
-		viper.SetDefault(a.Name, a.DefValue)
-		// If the flag is set, override viper value
-		if a.Changed {
-			viper.Set(a.Name, a.Value.String())
-		}
-		// Viper will give precedence first to calls to the Set command,
-		// then to values from the config.yml
-		a.Value.Set(viper.GetString(a.Name))
-		a.Changed = true
-	}
+// usageTemplate just calls translate.T on the default usage template
+// explicitly using the raw string instead of calling c.UsageTemplate()
+// so the extractor can find this monstrosity of a string
+func usageTemplate() string {
+	return fmt.Sprintf(`%s:{{if .Runnable}}
+  {{.UseLine}}{{end}}{{if .HasAvailableSubCommands}}
+  {{.CommandPath}} [command]{{end}}{{if gt (len .Aliases) 0}}
+
+%s:
+  {{.NameAndAliases}}{{end}}{{if .HasExample}}
+
+%s:
+{{.Example}}{{end}}{{if .HasAvailableSubCommands}}
+
+%s:{{range .Commands}}{{if (or .IsAvailableCommand (eq .Name "help"))}}
+  {{rpad .Name .NamePadding }} {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableLocalFlags}}
+
+%s:
+{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasAvailableInheritedFlags}}
+
+%s:
+{{.InheritedFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasHelpSubCommands}}
+
+%s:{{range .Commands}}{{if .IsAdditionalHelpTopicCommand}}
+  {{rpad .CommandPath .CommandPathPadding}} {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableSubCommands}}
+
+%s{{end}}
+`, translate.T("Usage"), translate.T("Aliases"), translate.T("Examples"), translate.T("Available Commands"), translate.T("Flags"), translate.T("Global Flags"), translate.T("Additional help topics"), translate.T(`Use "{{.CommandPath}} [command] --help" for more information about a command.`))
 }
 
 func init() {
-	RootCmd.PersistentFlags().StringP(config.MachineProfile, "p", constants.DefaultMachineName, `The name of the minikube VM being used.  
-	This can be modified to allow for multiple minikube instances to be run independently`)
-	RootCmd.PersistentFlags().StringP(configCmd.Bootstrapper, "b", constants.DefaultClusterBootstrapper, "The name of the cluster bootstrapper that will set up the kubernetes cluster.")
-	RootCmd.AddCommand(configCmd.ConfigCmd)
-	RootCmd.AddCommand(configCmd.AddonsCmd)
-	RootCmd.AddCommand(configCmd.ProfileCmd)
-	pflag.CommandLine.AddGoFlagSet(goflag.CommandLine)
-	viper.BindPFlags(RootCmd.PersistentFlags())
+	klog.InitFlags(nil)
+	// preset logtostderr and alsologtostderr only for test runs, for normal runs consider flags in main()
+	if strings.HasPrefix(filepath.Base(os.Args[0]), "e2e-") || strings.HasSuffix(os.Args[0], "test") {
+		if err := flag.Set("logtostderr", "false"); err != nil {
+			klog.Warningf("Unable to set default flag value for logtostderr: %v", err)
+		}
+		if err := flag.Set("alsologtostderr", "false"); err != nil {
+			klog.Warningf("Unable to set default flag value for alsologtostderr: %v", err)
+		}
+	}
+	pflag.CommandLine.AddGoFlagSet(flag.CommandLine) // avoid `generate-docs_test.go` complaining about "Docs are not updated"
 
+	RootCmd.PersistentFlags().StringP(config.ProfileName, "p", constants.DefaultClusterName, `The name of the minikube VM being used. This can be set to allow having multiple instances of minikube independently.`)
+	RootCmd.PersistentFlags().StringP(configCmd.Bootstrapper, "b", "kubeadm", "The name of the cluster bootstrapper that will set up the Kubernetes cluster.")
+
+	groups := templates.CommandGroups{
+		{
+			Message: translate.T("Basic Commands:"),
+			Commands: []*cobra.Command{
+				startCmd,
+				statusCmd,
+				stopCmd,
+				deleteCmd,
+				dashboardCmd,
+				pauseCmd,
+				unpauseCmd,
+			},
+		},
+		{
+			Message: translate.T("Images Commands:"),
+			Commands: []*cobra.Command{
+				dockerEnvCmd,
+				podmanEnvCmd,
+				cacheCmd,
+			},
+		},
+		{
+			Message: translate.T("Configuration and Management Commands:"),
+			Commands: []*cobra.Command{
+				configCmd.AddonsCmd,
+				configCmd.ConfigCmd,
+				configCmd.ProfileCmd,
+				updateContextCmd,
+			},
+		},
+		{
+			Message: translate.T("Networking and Connectivity Commands:"),
+			Commands: []*cobra.Command{
+				serviceCmd,
+				tunnelCmd,
+			},
+		},
+		{
+			Message: translate.T("Advanced Commands:"),
+			Commands: []*cobra.Command{
+				mountCmd,
+				sshCmd,
+				kubectlCmd,
+				nodeCmd,
+			},
+		},
+		{
+			Message: translate.T("Troubleshooting Commands:"),
+			Commands: []*cobra.Command{
+				sshKeyCmd,
+				ipCmd,
+				logsCmd,
+				updateCheckCmd,
+				versionCmd,
+				optionsCmd,
+			},
+		},
+	}
+	groups.Add(RootCmd)
+
+	// Ungrouped commands will show up in the "Other Commands" section
+	RootCmd.AddCommand(completionCmd)
+	templates.ActsAsRootCommand(RootCmd, []string{"options"}, groups...)
+
+	if err := viper.BindPFlags(RootCmd.PersistentFlags()); err != nil {
+		exit.Error(reason.InternalBindFlags, "Unable to bind flags", err)
+	}
+
+	translate.DetermineLocale()
 	cobra.OnInitialize(initConfig)
-
 }
 
 // initConfig reads in config file and ENV variables if set.
 func initConfig() {
-	configPath := constants.ConfigFile
+	configPath := localpath.ConfigFile()
 	viper.SetConfigFile(configPath)
 	viper.SetConfigType("json")
-	err := viper.ReadInConfig()
-	if err != nil {
-		glog.Warningf("Error reading config file at %s: %v", configPath, err)
+	if err := viper.ReadInConfig(); err != nil {
+		// This config file is optional, so don't emit errors if missing
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			klog.Warningf("Error reading config file at %s: %v", configPath, err)
+		}
 	}
 	setupViper()
 }
 
 func setupViper() {
-	viper.SetEnvPrefix(constants.MinikubeEnvPrefix)
+	viper.SetEnvPrefix(minikubeEnvPrefix)
 	// Replaces '-' in flags with '_' in env variables
 	// e.g. iso-url => $ENVPREFIX_ISO_URL
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
@@ -163,22 +272,10 @@ func setupViper() {
 	viper.SetDefault(config.WantNoneDriverWarning, true)
 	viper.SetDefault(config.ShowDriverDeprecationNotification, true)
 	viper.SetDefault(config.ShowBootstrapperDeprecationNotification, true)
-	setFlagsUsingViper()
 }
 
-// GetClusterBootstrapper returns a new bootstrapper for the cluster
-func GetClusterBootstrapper(api libmachine.API, bootstrapperName string) (bootstrapper.Bootstrapper, error) {
-	var b bootstrapper.Bootstrapper
-	var err error
-	switch bootstrapperName {
-	case bootstrapper.BootstrapperTypeKubeadm:
-		b, err = kubeadm.NewKubeadmBootstrapper(api)
-		if err != nil {
-			return nil, errors.Wrap(err, "getting kubeadm bootstrapper")
-		}
-	default:
-		return nil, fmt.Errorf("Unknown bootstrapper: %s", bootstrapperName)
-	}
-
-	return b, nil
+func addToPath(dir string) {
+	new := fmt.Sprintf("%s:%s", dir, os.Getenv("PATH"))
+	klog.Infof("Updating PATH: %s", dir)
+	os.Setenv("PATH", new)
 }

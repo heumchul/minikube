@@ -27,7 +27,17 @@ set -e
 
 OS_ARCH="linux-amd64"
 VM_DRIVER="kvm2"
-JOB_NAME="Linux-KVM"
+JOB_NAME="KVM_Linux"
+EXPECTED_DEFAULT_DRIVER="kvm2"
 
-# Download files and set permissions
+# We pick kvm as our gvisor testbed because it is fast & reliable
+EXTRA_TEST_ARGS="-gvisor"
+
+mkdir -p cron && gsutil -qm rsync "gs://minikube-builds/${MINIKUBE_LOCATION}/cron" cron || echo "FAILED TO GET CRON FILES"
+sudo install cron/cleanup_and_reboot_Linux.sh /etc/cron.hourly/cleanup_and_reboot || echo "FAILED TO INSTALL CLEANUP"
+
+sudo apt-get update
+sudo apt-get -y install qemu-system libvirt-clients libvirt-daemon-system ebtables iptables dnsmasq
+sudo adduser jenkins libvirt || true
+
 source ./common.sh

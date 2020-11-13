@@ -17,194 +17,234 @@ limitations under the License.
 package machine
 
 import (
-	"io/ioutil"
+	"fmt"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/golang/glog"
-	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	"github.com/docker/docker/client"
+	"github.com/docker/machine/libmachine/state"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/assets"
 	"k8s.io/minikube/pkg/minikube/bootstrapper"
+	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/cruntime"
-	"k8s.io/minikube/pkg/minikube/sshutil"
+	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/image"
+	"k8s.io/minikube/pkg/minikube/localpath"
+	"k8s.io/minikube/pkg/minikube/vmpath"
 )
 
-const tempLoadDir = "/tmp"
-
-var getWindowsVolumeName = getWindowsVolumeNameCmd
+// loadRoot is where images should be loaded from within the guest VM
+var loadRoot = path.Join(vmpath.GuestPersistentDir, "images")
 
 // loadImageLock is used to serialize image loads to avoid overloading the guest VM
 var loadImageLock sync.Mutex
 
-func CacheImagesForBootstrapper(version string, clusterBootstrapper string) error {
-	images := bootstrapper.GetCachedImageList(version, clusterBootstrapper)
+// CacheImagesForBootstrapper will cache images for a bootstrapper
+func CacheImagesForBootstrapper(imageRepository string, version string, clusterBootstrapper string) error {
+	images, err := bootstrapper.GetCachedImageList(imageRepository, version, clusterBootstrapper)
+	if err != nil {
+		return errors.Wrap(err, "cached images list")
+	}
 
-	if err := CacheImages(images, constants.ImageCacheDir); err != nil {
+	if err := image.SaveToDir(images, constants.ImageCacheDir); err != nil {
 		return errors.Wrapf(err, "Caching images for %s", clusterBootstrapper)
 	}
 
 	return nil
 }
 
-// CacheImages will cache images on the host
-//
-// The cache directory currently caches images using the imagename_tag
-// For example, k8s.gcr.io/kube-addon-manager:v6.5 would be
-// stored at $CACHE_DIR/k8s.gcr.io/kube-addon-manager_v6.5
-func CacheImages(images []string, cacheDir string) error {
-	var g errgroup.Group
-	for _, image := range images {
-		image := image
-		g.Go(func() error {
-			dst := filepath.Join(cacheDir, image)
-			dst = sanitizeCacheDir(dst)
-			if err := CacheImage(image, dst); err != nil {
-				return errors.Wrapf(err, "caching image %s", dst)
-			}
-			return nil
-		})
+// LoadImages loads previously cached images into the container runtime
+func LoadImages(cc *config.ClusterConfig, runner command.Runner, images []string, cacheDir string) error {
+	cr, err := cruntime.New(cruntime.Config{Type: cc.KubernetesConfig.ContainerRuntime, Runner: runner})
+	if err != nil {
+		return errors.Wrap(err, "runtime")
 	}
-	if err := g.Wait(); err != nil {
-		return errors.Wrap(err, "caching images")
-	}
-	glog.Infoln("Successfully cached all images.")
-	return nil
-}
 
-func LoadImages(cmd bootstrapper.CommandRunner, images []string, cacheDir string) error {
-	var g errgroup.Group
-	// Load profile cluster config from file
-	cc, err := config.Load()
-	if err != nil && !os.IsNotExist(err) {
-		glog.Errorln("Error loading profile config: ", err)
+	// Skip loading images if images already exist
+	if cr.ImagesPreloaded(images) {
+		klog.Infof("Images are preloaded, skipping loading")
+		return nil
 	}
+	klog.Infof("LoadImages start: %s", images)
+	start := time.Now()
+
+	defer func() {
+		klog.Infof("LoadImages completed in %s", time.Since(start))
+	}()
+
+	var g errgroup.Group
+
+	var imgClient *client.Client
+	if cr.Name() == "Docker" {
+		imgClient, err = client.NewClientWithOpts(client.FromEnv) // image client
+		if err != nil {
+			klog.Infof("couldn't get a local image daemon which might be ok: %v", err)
+		}
+	}
+
 	for _, image := range images {
 		image := image
 		g.Go(func() error {
-			src := filepath.Join(cacheDir, image)
-			src = sanitizeCacheDir(src)
-			if err := LoadFromCacheBlocking(cmd, cc.KubernetesConfig, src); err != nil {
-				return errors.Wrapf(err, "loading image %s", src)
+			// Put a ten second limit on deciding if an image needs transfer
+			// because it takes much less than that time to just transfer the image.
+			// This is needed because if running in offline mode, we can spend minutes here
+			// waiting for i/o timeout.
+			err := timedNeedsTransfer(imgClient, image, cr, 10*time.Second)
+			if err == nil {
+				return nil
 			}
-			return nil
+			klog.Infof("%q needs transfer: %v", image, err)
+			return transferAndLoadImage(runner, cc.KubernetesConfig, image, cacheDir)
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return errors.Wrap(err, "loading cached images")
 	}
-	glog.Infoln("Successfully loaded all cached images.")
+	klog.Infoln("Successfully loaded all cached images")
 	return nil
 }
 
-func CacheAndLoadImages(images []string) error {
-	if err := CacheImages(images, constants.ImageCacheDir); err != nil {
+func timedNeedsTransfer(imgClient *client.Client, imgName string, cr cruntime.Manager, t time.Duration) error {
+	timeout := make(chan bool, 1)
+	go func() {
+		time.Sleep(t)
+		timeout <- true
+	}()
+
+	transferFinished := make(chan bool, 1)
+	var err error
+	go func() {
+		err = needsTransfer(imgClient, imgName, cr)
+		transferFinished <- true
+	}()
+
+	select {
+	case <-transferFinished:
 		return err
+	case <-timeout:
+		return fmt.Errorf("needs transfer timed out in %f seconds", t.Seconds())
 	}
+}
+
+// needsTransfer returns an error if an image needs to be retransfered
+func needsTransfer(imgClient *client.Client, imgName string, cr cruntime.Manager) error {
+	imgDgst := ""         // for instance sha256:7c92a2c6bbcb6b6beff92d0a940779769c2477b807c202954c537e2e0deb9bed
+	if imgClient != nil { // if possible try to get img digest from Client lib which is 4s faster.
+		imgDgst = image.DigestByDockerLib(imgClient, imgName)
+		if imgDgst != "" {
+			if !cr.ImageExists(imgName, imgDgst) {
+				return fmt.Errorf("%q does not exist at hash %q in container runtime", imgName, imgDgst)
+			}
+			return nil
+		}
+	}
+	// if not found with method above try go-container lib (which is 4s slower)
+	imgDgst = image.DigestByGoLib(imgName)
+	if imgDgst == "" {
+		return fmt.Errorf("got empty img digest %q for %s", imgDgst, imgName)
+	}
+	if !cr.ImageExists(imgName, imgDgst) {
+		return fmt.Errorf("%q does not exist at hash %q in container runtime", imgName, imgDgst)
+	}
+	return nil
+}
+
+// CacheAndLoadImages caches and loads images to all profiles
+func CacheAndLoadImages(images []string) error {
+	if len(images) == 0 {
+		return nil
+	}
+
+	// This is the most important thing
+	if err := image.SaveToDir(images, constants.ImageCacheDir); err != nil {
+		return errors.Wrap(err, "save to dir")
+	}
+
 	api, err := NewAPIClient()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "api")
 	}
 	defer api.Close()
-	h, err := api.Load(config.GetMachineName())
+	profiles, _, err := config.ListProfiles() // need to load image to all profiles
 	if err != nil {
-		return err
+		return errors.Wrap(err, "list profiles")
 	}
 
-	client, err := sshutil.NewSSHClient(h.Driver)
-	if err != nil {
-		return err
-	}
-	cmdRunner, err := bootstrapper.NewSSHRunner(client), nil
-	if err != nil {
-		return err
-	}
+	succeeded := []string{}
+	failed := []string{}
 
-	return LoadImages(cmdRunner, images, constants.ImageCacheDir)
-}
+	for _, p := range profiles { // loading images to all running profiles
+		pName := p.Name // capture the loop variable
 
-// # ParseReference cannot have a : in the directory path
-func sanitizeCacheDir(image string) string {
-	if runtime.GOOS == "windows" && hasWindowsDriveLetter(image) {
-		// not sanitize Windows drive letter.
-		return image[:2] + strings.Replace(image[2:], ":", "_", -1)
-	}
-	return strings.Replace(image, ":", "_", -1)
-}
+		c, err := config.Load(pName)
+		if err != nil {
+			// Non-fatal because it may race with profile deletion
+			klog.Errorf("Failed to load profile %q: %v", pName, err)
+			failed = append(failed, pName)
+			continue
+		}
 
-func hasWindowsDriveLetter(s string) bool {
-	if len(s) < 3 {
-		return false
-	}
+		for _, n := range c.Nodes {
+			m := driver.MachineName(*c, n)
 
-	drive := s[:3]
-	for _, b := range "CDEFGHIJKLMNOPQRSTUVWXYZABcdefghijklmnopqrstuvwxyzab" {
-		if d := string(b) + ":"; drive == d+`\` || drive == d+`/` {
-			return true
+			status, err := Status(api, m)
+			if err != nil {
+				klog.Warningf("error getting status for %s: %v", m, err)
+				failed = append(failed, m)
+				continue
+			}
+
+			if status == state.Running.String() { // the not running hosts will load on next start
+				h, err := api.Load(m)
+				if err != nil {
+					klog.Warningf("Failed to load machine %q: %v", m, err)
+					failed = append(failed, m)
+					continue
+				}
+				cr, err := CommandRunner(h)
+				if err != nil {
+					return err
+				}
+				err = LoadImages(c, cr, images, constants.ImageCacheDir)
+				if err != nil {
+					failed = append(failed, m)
+					klog.Warningf("Failed to load cached images for profile %s. make sure the profile is running. %v", pName, err)
+				}
+				succeeded = append(succeeded, m)
+			}
 		}
 	}
 
-	return false
+	klog.Infof("succeeded pushing to: %s", strings.Join(succeeded, " "))
+	klog.Infof("failed pushing to: %s", strings.Join(failed, " "))
+	// Live pushes are not considered a failure
+	return nil
 }
 
-// Replace a drive letter to a volume name.
-func replaceWinDriveLetterToVolumeName(s string) (string, error) {
-	vname, err := getWindowsVolumeName(s[:1])
+// transferAndLoadImage transfers and loads a single image from the cache
+func transferAndLoadImage(cr command.Runner, k8s config.KubernetesConfig, imgName string, cacheDir string) error {
+	r, err := cruntime.New(cruntime.Config{Type: k8s.ContainerRuntime, Runner: cr})
 	if err != nil {
-		return "", err
+		return errors.Wrap(err, "runtime")
 	}
-	path := vname + s[3:]
-
-	return path, nil
-}
-
-func getWindowsVolumeNameCmd(d string) (string, error) {
-	cmd := exec.Command("wmic", "volume", "where", "DriveLetter = '"+d+":'", "get", "DeviceID")
-
-	stdout, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-
-	outs := strings.Split(strings.Replace(string(stdout), "\r", "", -1), "\n")
-
-	var vname string
-	for _, l := range outs {
-		s := strings.TrimSpace(l)
-		if strings.HasPrefix(s, `\\?\Volume{`) && strings.HasSuffix(s, `}\`) {
-			vname = s
-			break
-		}
-	}
-
-	if vname == "" {
-		return "", errors.New("failed to get a volume GUID")
-	}
-
-	return vname, nil
-}
-
-func LoadFromCacheBlocking(cr bootstrapper.CommandRunner, k8s config.KubernetesConfig, src string) error {
-	glog.Infoln("Loading image from cache at ", src)
+	src := filepath.Join(cacheDir, imgName)
+	src = localpath.SanitizeCacheDir(src)
+	klog.Infof("Loading image from cache: %s", src)
 	filename := filepath.Base(src)
-	for {
-		if _, err := os.Stat(src); err == nil {
-			break
-		}
+	if _, err := os.Stat(src); err != nil {
+		return err
 	}
-	dst := path.Join(tempLoadDir, filename)
-	f, err := assets.NewFileAsset(src, tempLoadDir, filename, "0777")
+	dst := path.Join(loadRoot, filename)
+	f, err := assets.NewFileAsset(src, loadRoot, filename, "0644")
 	if err != nil {
 		return errors.Wrapf(err, "creating copyable file asset: %s", filename)
 	}
@@ -212,10 +252,6 @@ func LoadFromCacheBlocking(cr bootstrapper.CommandRunner, k8s config.KubernetesC
 		return errors.Wrap(err, "transferring cached image")
 	}
 
-	r, err := cruntime.New(cruntime.Config{Type: k8s.ContainerRuntime, Runner: cr})
-	if err != nil {
-		return errors.Wrap(err, "runtime")
-	}
 	loadImageLock.Lock()
 	defer loadImageLock.Unlock()
 
@@ -223,96 +259,7 @@ func LoadFromCacheBlocking(cr bootstrapper.CommandRunner, k8s config.KubernetesC
 	if err != nil {
 		return errors.Wrapf(err, "%s load %s", r.Name(), dst)
 	}
-	loadImageLock.Unlock()
 
-	if err := cr.Run("sudo rm -rf " + dst); err != nil {
-		return errors.Wrap(err, "deleting temp docker image location")
-	}
-	glog.Infof("Successfully loaded image %s from cache", src)
+	klog.Infof("Transferred and loaded %s from cache", src)
 	return nil
-}
-
-func DeleteFromImageCacheDir(images []string) error {
-	for _, image := range images {
-		path := filepath.Join(constants.ImageCacheDir, image)
-		path = sanitizeCacheDir(path)
-		glog.Infoln("Deleting image in cache at ", path)
-		if err := os.Remove(path); err != nil {
-			return err
-		}
-	}
-	return cleanImageCacheDir()
-}
-
-func cleanImageCacheDir() error {
-	err := filepath.Walk(constants.ImageCacheDir, func(path string, info os.FileInfo, err error) error {
-		// If error is not nil, it's because the path was already deleted and doesn't exist
-		// Move on to next path
-		if err != nil {
-			return nil
-		}
-		// Check if path is directory
-		if !info.IsDir() {
-			return nil
-		}
-		// If directory is empty, delete it
-		entries, err := ioutil.ReadDir(path)
-		if err != nil {
-			return err
-		}
-		if len(entries) == 0 {
-			if err = os.Remove(path); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	return err
-}
-
-func getDstPath(image, dst string) (string, error) {
-	if runtime.GOOS == "windows" && hasWindowsDriveLetter(dst) {
-		// ParseReference does not support a Windows drive letter.
-		// Therefore, will replace the drive letter to a volume name.
-		var err error
-		if dst, err = replaceWinDriveLetterToVolumeName(dst); err != nil {
-			return "", errors.Wrap(err, "parsing docker archive dst ref: replace a Win drive letter to a volume name")
-		}
-	}
-
-	return dst, nil
-}
-
-func CacheImage(image, dst string) error {
-	glog.Infof("Attempting to cache image: %s at %s\n", image, dst)
-	if _, err := os.Stat(dst); err == nil {
-		return nil
-	}
-
-	dstPath, err := getDstPath(image, dst)
-	if err != nil {
-		return errors.Wrap(err, "getting destination path")
-	}
-
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0777); err != nil {
-		return errors.Wrapf(err, "making cache image directory: %s", dst)
-	}
-
-	tag, err := name.NewTag(image, name.WeakValidation)
-	if err != nil {
-		return errors.Wrap(err, "creating docker image name")
-	}
-
-	img, err := remote.Image(tag, remote.WithAuthFromKeychain(authn.DefaultKeychain))
-	if err != nil {
-		return errors.Wrap(err, "fetching remote image")
-	}
-
-	glog.Infoln("OPENING: ", dstPath)
-	f, err := os.Create(dstPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return tarball.Write(tag, img, nil, f)
 }

@@ -20,134 +20,209 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sync"
-
+	"os/signal"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 
-	"github.com/golang/glog"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	cmdUtil "k8s.io/minikube/cmd/util"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/cluster"
-	"k8s.io/minikube/pkg/minikube/config"
-	"k8s.io/minikube/pkg/minikube/constants"
-	"k8s.io/minikube/pkg/minikube/machine"
+	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/mustload"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
 	"k8s.io/minikube/third_party/go9p/ufs"
 )
 
-var mountIP string
-var mountVersion string
-var isKill bool
-var uid int
-var gid int
-var msize int
+const (
+	// nineP is the value of --type used for the 9p filesystem.
+	nineP               = "9p"
+	defaultMountVersion = "9p2000.L"
+	defaultMsize        = 262144
+)
+
+// placeholders for flag values
+var (
+	mountIP      string
+	mountVersion string
+	mountType    string
+	isKill       bool
+	uid          string
+	gid          string
+	mSize        int
+	options      []string
+	mode         uint
+)
+
+// supportedFilesystems is a map of filesystem types to not warn against.
+var supportedFilesystems = map[string]bool{nineP: true}
 
 // mountCmd represents the mount command
 var mountCmd = &cobra.Command{
-	Use:   "mount [flags] MOUNT_DIRECTORY(ex:\"/home\")",
+	Use:   "mount [flags] <source directory>:<target directory>",
 	Short: "Mounts the specified directory into minikube",
 	Long:  `Mounts the specified directory into minikube.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if isKill {
-			if err := cmdUtil.KillMountProcess(); err != nil {
-				fmt.Println("Errors occurred deleting mount process: ", err)
-				os.Exit(1)
+			if err := killMountProcess(); err != nil {
+				exit.Error(reason.HostKillMountProc, "Error killing mount process", err)
 			}
 			os.Exit(0)
 		}
 
 		if len(args) != 1 {
-			errText := `Please specify the directory to be mounted: 
-	minikube mount HOST_MOUNT_DIRECTORY:VM_MOUNT_DIRECTORY(ex:"/host-home:/vm-home")
-`
-			fmt.Fprintln(os.Stderr, errText)
-			os.Exit(1)
+			exit.Message(reason.Usage, `Please specify the directory to be mounted: 
+	minikube mount <source directory>:<target directory>   (example: "/host-home:/vm-home")`)
 		}
 		mountString := args[0]
 		idx := strings.LastIndex(mountString, ":")
 		if idx == -1 { // no ":" was present
-			errText := `Mount directory must be in the form: 
-	HOST_MOUNT_DIRECTORY:VM_MOUNT_DIRECTORY`
-			fmt.Fprintln(os.Stderr, errText)
-			os.Exit(1)
+			exit.Message(reason.Usage, `mount argument "{{.value}}" must be in form: <source directory>:<target directory>`, out.V{"value": mountString})
 		}
 		hostPath := mountString[:idx]
 		vmPath := mountString[idx+1:]
 		if _, err := os.Stat(hostPath); err != nil {
 			if os.IsNotExist(err) {
-				errText := fmt.Sprintf("Cannot find directory %s for mount", hostPath)
-				fmt.Fprintln(os.Stderr, errText)
+				exit.Message(reason.HostPathMissing, "Cannot find directory {{.path}} for mount", out.V{"path": hostPath})
 			} else {
-				errText := fmt.Sprintf("Error accessing directory %s for mount", hostPath)
-				fmt.Fprintln(os.Stderr, errText)
+				exit.Error(reason.HostPathStat, "stat failed", err)
 			}
-			os.Exit(1)
 		}
 		if len(vmPath) == 0 || !strings.HasPrefix(vmPath, "/") {
-			errText := fmt.Sprintf("The :VM_MOUNT_DIRECTORY must be an absolute path")
-			fmt.Fprintln(os.Stderr, errText)
-			os.Exit(1)
+			exit.Message(reason.Usage, "Target directory {{.path}} must be an absolute path", out.V{"path": vmPath})
 		}
 		var debugVal int
-		if glog.V(1) {
+		if klog.V(1).Enabled() {
 			debugVal = 1 // ufs.StartServer takes int debug param
 		}
-		api, err := machine.NewAPIClient()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting client: %v\n", err)
-			os.Exit(1)
+
+		co := mustload.Running(ClusterFlagValue())
+		if co.CP.Host.Driver.DriverName() == driver.None {
+			exit.Message(reason.Usage, `'none' driver does not support 'minikube mount' command`)
 		}
-		defer api.Close()
-		host, err := api.Load(config.GetMachineName())
-		if err != nil {
-			glog.Errorln("Error loading api: ", err)
-			os.Exit(1)
-		}
-		if host.Driver.DriverName() == "none" {
-			fmt.Println(`'none' driver does not support 'minikube mount' command`)
-			os.Exit(0)
-		}
+
 		var ip net.IP
+		var err error
 		if mountIP == "" {
-			ip, err = cluster.GetVMHostIP(host)
+			ip, err = cluster.HostIP(co.CP.Host, co.Config.Name)
 			if err != nil {
-				glog.Errorln("Error getting the host IP address to use from within the VM: ", err)
-				os.Exit(1)
+				exit.Error(reason.IfHostIP, "Error getting the host IP address to use from within the VM", err)
 			}
 		} else {
 			ip = net.ParseIP(mountIP)
 			if ip == nil {
-				glog.Errorln("error parsing the input ip address for mount")
-				os.Exit(1)
+				exit.Message(reason.IfMountIP, "error parsing the input ip address for mount")
 			}
 		}
-		fmt.Printf("Mounting %s into %s on the minikube VM\n", hostPath, vmPath)
-		fmt.Println("This daemon process needs to stay alive for the mount to still be accessible...")
-		port, err := cmdUtil.GetPort()
+		port, err := getPort()
 		if err != nil {
-			glog.Errorln("Error finding port for mount: ", err)
-			os.Exit(1)
+			exit.Error(reason.IfMountPort, "Error finding port for mount", err)
 		}
+
+		cfg := &cluster.MountConfig{
+			Type:    mountType,
+			UID:     uid,
+			GID:     gid,
+			Version: mountVersion,
+			MSize:   mSize,
+			Port:    port,
+			Mode:    os.FileMode(mode),
+			Options: map[string]string{},
+		}
+
+		for _, o := range options {
+			if !strings.Contains(o, "=") {
+				cfg.Options[o] = ""
+				continue
+			}
+			parts := strings.Split(o, "=")
+			cfg.Options[parts[0]] = parts[1]
+		}
+
+		// An escape valve to allow future hackers to try NFS, VirtFS, or other FS types.
+		if !supportedFilesystems[cfg.Type] {
+			out.WarningT("{{.type}} is not yet a supported filesystem. We will try anyways!", out.V{"type": cfg.Type})
+		}
+
+		bindIP := ip.String() // the ip to listen on the user's host machine
+		if driver.IsKIC(co.CP.Host.Driver.DriverName()) && runtime.GOOS != "linux" {
+			bindIP = "127.0.0.1"
+		}
+		out.T(style.Mounting, "Mounting host path {{.sourcePath}} into VM as {{.destinationPath}} ...", out.V{"sourcePath": hostPath, "destinationPath": vmPath})
+		out.Infof("Mount type:   {{.name}}", out.V{"type": cfg.Type})
+		out.Infof("User ID:      {{.userID}}", out.V{"userID": cfg.UID})
+		out.Infof("Group ID:     {{.groupID}}", out.V{"groupID": cfg.GID})
+		out.Infof("Version:      {{.version}}", out.V{"version": cfg.Version})
+		out.Infof("Message Size: {{.size}}", out.V{"size": cfg.MSize})
+		out.Infof("Permissions:  {{.octalMode}} ({{.writtenMode}})", out.V{"octalMode": fmt.Sprintf("%o", cfg.Mode), "writtenMode": cfg.Mode})
+		out.Infof("Options:      {{.options}}", out.V{"options": cfg.Options})
+		out.Infof("Bind Address: {{.Address}}", out.V{"Address": net.JoinHostPort(bindIP, fmt.Sprint(port))})
+
 		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			ufs.StartServer(net.JoinHostPort(ip.String(), port), debugVal, hostPath)
-			wg.Done()
-		}()
-		err = cluster.MountHost(api, ip, vmPath, port, mountVersion, uid, gid, msize)
-		if err != nil {
-			fmt.Println(err.Error())
-			os.Exit(1)
+		if cfg.Type == nineP {
+			wg.Add(1)
+			go func() {
+				out.T(style.Fileserver, "Userspace file server: ")
+				ufs.StartServer(net.JoinHostPort(bindIP, strconv.Itoa(port)), debugVal, hostPath)
+				out.T(style.Stopped, "Userspace file server is shutdown")
+				wg.Done()
+			}()
 		}
+
+		// Unmount if Ctrl-C or kill request is received.
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+		go func() {
+			for sig := range c {
+				out.T(style.Unmount, "Unmounting {{.path}} ...", out.V{"path": vmPath})
+				err := cluster.Unmount(co.CP.Runner, vmPath)
+				if err != nil {
+					out.FailureT("Failed unmount: {{.error}}", out.V{"error": err})
+				}
+				exit.Message(reason.Interrupted, "Received {{.name}} signal", out.V{"name": sig})
+			}
+		}()
+
+		err = cluster.Mount(co.CP.Runner, ip.String(), vmPath, cfg)
+		if err != nil {
+			exit.Error(reason.GuestMount, "mount failed", err)
+		}
+		out.T(style.Success, "Successfully mounted {{.sourcePath}} to {{.destinationPath}}", out.V{"sourcePath": hostPath, "destinationPath": vmPath})
+		out.Ln("")
+		out.T(style.Notice, "NOTE: This process must stay alive for the mount to be accessible ...")
 		wg.Wait()
 	},
 }
 
 func init() {
 	mountCmd.Flags().StringVar(&mountIP, "ip", "", "Specify the ip that the mount should be setup on")
-	mountCmd.Flags().StringVar(&mountVersion, "9p-version", constants.DefaultMountVersion, "Specify the 9p version that the mount should use")
+	mountCmd.Flags().StringVar(&mountType, "type", nineP, "Specify the mount filesystem type (supported types: 9p)")
+	mountCmd.Flags().StringVar(&mountVersion, "9p-version", defaultMountVersion, "Specify the 9p version that the mount should use")
 	mountCmd.Flags().BoolVar(&isKill, "kill", false, "Kill the mount process spawned by minikube start")
-	mountCmd.Flags().IntVar(&uid, "uid", 1001, "Default user id used for the mount")
-	mountCmd.Flags().IntVar(&gid, "gid", 1001, "Default group id used for the mount")
-	mountCmd.Flags().IntVar(&msize, "msize", constants.DefaultMsize, "The number of bytes to use for 9p packet payload")
-	RootCmd.AddCommand(mountCmd)
+	mountCmd.Flags().StringVar(&uid, "uid", "docker", "Default user id used for the mount")
+	mountCmd.Flags().StringVar(&gid, "gid", "docker", "Default group id used for the mount")
+	mountCmd.Flags().UintVar(&mode, "mode", 0o755, "File permissions used for the mount")
+	mountCmd.Flags().StringSliceVar(&options, "options", []string{}, "Additional mount options, such as cache=fscache")
+	mountCmd.Flags().IntVar(&mSize, "msize", defaultMsize, "The number of bytes to use for 9p packet payload")
+}
+
+// getPort asks the kernel for a free open port that is ready to use
+func getPort() (int, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		panic(err)
+	}
+
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return -1, errors.Errorf("Error accessing port %d", addr.Port)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
 }

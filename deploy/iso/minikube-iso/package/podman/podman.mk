@@ -1,6 +1,7 @@
-PODMAN_VERSION = v1.0.0
-PODMAN_COMMIT = 82e80110c3f2d8728745c47e340f3bee4d408846
-PODMAN_SITE = https://github.com/containers/libpod/archive
+PODMAN_DUMMY = DUMMY
+PODMAN_VERSION = v1.9.3
+PODMAN_COMMIT = 5d44534fff6877b1cb15b760242279ae6293154c
+PODMAN_SITE = https://github.com/containers/podman/archive
 PODMAN_SOURCE = $(PODMAN_VERSION).tar.gz
 PODMAN_LICENSE = Apache-2.0
 PODMAN_LICENSE_FILES = LICENSE
@@ -9,6 +10,7 @@ PODMAN_DEPENDENCIES = host-go
 
 PODMAN_GOPATH = $(@D)/_output
 PODMAN_BIN_ENV = \
+	$(GO_TARGET_ENV) \
 	CGO_ENABLED=1 \
 	GOPATH="$(PODMAN_GOPATH)" \
 	GOBIN="$(PODMAN_GOPATH)/bin" \
@@ -20,16 +22,17 @@ define PODMAN_CONFIGURE_CMDS
 	ln -sf $(@D) $(PODMAN_GOPATH)/src/github.com/containers/libpod
 	mkdir -p $(PODMAN_GOPATH)/src/github.com/varlink
 	ln -sf $(@D)/vendor/github.com/varlink/go $(PODMAN_GOPATH)/src/github.com/varlink/go
-	$(PODMAN_BIN_ENV) $(MAKE) $(TARGET_CONFIGURE_OPTS) -C $(@D) install.tools DESTDIR=$(TARGET_DIR) PREFIX=$(TARGET_DIR)/usr
 endef
 
 define PODMAN_BUILD_CMDS
 	mkdir -p $(@D)/bin
-	$(PODMAN_BIN_ENV) $(MAKE) $(TARGET_CONFIGURE_OPTS) -C $(@D) GIT_COMMIT=$(PODMAN_COMMIT) PREFIX=/usr podman
+	$(PODMAN_BIN_ENV) CIRRUS_TAG=$(PODMAN_VERSION) $(MAKE) $(TARGET_CONFIGURE_OPTS) -C $(@D) GIT_COMMIT=$(PODMAN_COMMIT) PREFIX=/usr podman
 endef
 
 define PODMAN_INSTALL_TARGET_CMDS
 	$(INSTALL) -Dm755 $(@D)/bin/podman $(TARGET_DIR)/usr/bin/podman
+	$(INSTALL) -d -m 755 $(TARGET_DIR)/etc/cni/net.d/
+	$(INSTALL) -m 644 $(@D)/cni/87-podman-bridge.conflist $(TARGET_DIR)/etc/cni/net.d/87-podman-bridge.conflist
 endef
 
 $(eval $(generic-package))

@@ -18,37 +18,38 @@ package none
 
 import (
 	"fmt"
-	"strings"
+	"os/exec"
 
 	"github.com/docker/machine/libmachine/drivers"
 	"github.com/docker/machine/libmachine/state"
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
-	"k8s.io/apimachinery/pkg/util/net"
-
+	knet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/klog/v2"
 	pkgdrivers "k8s.io/minikube/pkg/drivers"
-	// TODO(tstromberg): Extract CommandRunner into its own package
-	"k8s.io/minikube/pkg/minikube/bootstrapper"
+	"k8s.io/minikube/pkg/minikube/bootstrapper/bsutil/kverify"
+	"k8s.io/minikube/pkg/minikube/command"
+	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/cruntime"
+	"k8s.io/minikube/pkg/minikube/kubeconfig"
+	"k8s.io/minikube/pkg/minikube/sysinit"
+	"k8s.io/minikube/pkg/minikube/vmpath"
 )
-
-const driverName = "none"
 
 // cleanupPaths are paths to be removed by cleanup, and are used by both kubeadm and minikube.
 var cleanupPaths = []string{
-	"/data/minikube",
-	"/etc/kubernetes/manifests",
-	"/var/lib/minikube",
+	vmpath.GuestEphemeralDir,
+	vmpath.GuestManifestsDir,
+	vmpath.GuestPersistentDir,
 }
 
-// none Driver is a driver designed to run kubeadm w/o VM management, and assumes systemctl.
-// https://github.com/kubernetes/minikube/blob/master/docs/vmdriver-none.md
+// Driver is a driver designed to run kubeadm w/o VM management, and assumes systemctl.
+// https://minikube.sigs.k8s.io/docs/reference/drivers/none/
 type Driver struct {
 	*drivers.BaseDriver
 	*pkgdrivers.CommonDriver
 	URL     string
 	runtime cruntime.Manager
-	exec    bootstrapper.CommandRunner
+	exec    command.Runner
 }
 
 // Config is configuration for the None driver
@@ -60,11 +61,11 @@ type Config struct {
 
 // NewDriver returns a fully configured None driver
 func NewDriver(c Config) *Driver {
-	runner := &bootstrapper.ExecRunner{}
+	runner := command.NewExecRunner()
 	runtime, err := cruntime.New(cruntime.Config{Type: c.ContainerRuntime, Runner: runner})
 	// Libraries shouldn't panic, but there is no way for drivers to return error :(
 	if err != nil {
-		glog.Fatalf("unable to create container runtime: %v", err)
+		klog.Fatalf("unable to create container runtime: %v", err)
 	}
 	return &Driver{
 		BaseDriver: &drivers.BaseDriver{
@@ -81,6 +82,7 @@ func (d *Driver) PreCreateCheck() error {
 	return d.runtime.Available()
 }
 
+// Create a host using the driver's config
 func (d *Driver) Create() error {
 	// creation for the none driver is handled by commands.go
 	return nil
@@ -88,12 +90,12 @@ func (d *Driver) Create() error {
 
 // DriverName returns the name of the driver
 func (d *Driver) DriverName() string {
-	return driverName
+	return "none"
 }
 
 // GetIP returns an IP or hostname that this host is available at
 func (d *Driver) GetIP() (string, error) {
-	ip, err := net.ChooseBindAddress(nil)
+	ip, err := knet.ChooseHostInterface()
 	if err != nil {
 		return "", err
 	}
@@ -110,8 +112,9 @@ func (d *Driver) GetSSHPort() (int, error) {
 	return 0, fmt.Errorf("driver does not support ssh commands")
 }
 
-// GetURL returns a Docker compatible host URL for connecting to this host
+// GetURL returns a Docker URL inside this host
 // e.g. tcp://1.2.3.4:2376
+// more info https://github.com/docker/machine/blob/b170508bf44c3405e079e26d5fdffe35a64c6972/libmachine/provision/utils.go#L159_L175
 func (d *Driver) GetURL() (string, error) {
 	ip, err := d.GetIP()
 	if err != nil {
@@ -122,25 +125,51 @@ func (d *Driver) GetURL() (string, error) {
 
 // GetState returns the state that the host is in (running, stopped, etc)
 func (d *Driver) GetState() (state.State, error) {
-	if err := checkKubelet(d.exec); err != nil {
-		glog.Infof("kubelet not running: %v", err)
-		return state.Stopped, nil
+	hostname, port, err := kubeconfig.Endpoint(d.BaseDriver.MachineName)
+	if err != nil {
+		klog.Warningf("unable to get port: %v", err)
+		port = constants.APIServerPort
 	}
-	return state.Running, nil
+
+	// Confusing logic, as libmachine.Stop will loop until the state == Stopped
+	ast, err := kverify.APIServerStatus(d.exec, hostname, port)
+	if err != nil {
+		return ast, err
+	}
+
+	// If the apiserver is up, we'll claim to be up.
+	if ast == state.Paused || ast == state.Running {
+		return state.Running, nil
+	}
+
+	return kverify.ServiceStatus(d.exec, "kubelet"), nil
 }
 
 // Kill stops a host forcefully, including any containers that we are managing.
 func (d *Driver) Kill() error {
-	if err := stopKubelet(d.exec); err != nil {
-		return errors.Wrap(err, "kubelet")
+	if err := sysinit.New(d.exec).ForceStop("kubelet"); err != nil {
+		klog.Warningf("couldn't force stop kubelet. will continue with kill anyways: %v", err)
 	}
-	containers, err := d.runtime.ListContainers(cruntime.MinikubeContainerPrefix)
+
+	// First try to gracefully stop containers
+	containers, err := d.runtime.ListContainers(cruntime.ListOptions{})
 	if err != nil {
 		return errors.Wrap(err, "containers")
+	}
+	if len(containers) == 0 {
+		return nil
 	}
 	// Try to be graceful before sending SIGKILL everywhere.
 	if err := d.runtime.StopContainers(containers); err != nil {
 		return errors.Wrap(err, "stop")
+	}
+
+	containers, err = d.runtime.ListContainers(cruntime.ListOptions{})
+	if err != nil {
+		return errors.Wrap(err, "containers")
+	}
+	if len(containers) == 0 {
+		return nil
 	}
 	if err := d.runtime.KillContainers(containers); err != nil {
 		return errors.Wrap(err, "kill")
@@ -153,10 +182,10 @@ func (d *Driver) Remove() error {
 	if err := d.Kill(); err != nil {
 		return errors.Wrap(err, "kill")
 	}
-	// TODO(#3637): Make sure this calls into the bootstrapper to perform `kubeadm reset`
-	cmd := fmt.Sprintf("sudo rm -rf %s", strings.Join(cleanupPaths, " "))
-	if err := d.exec.Run(cmd); err != nil {
-		glog.Errorf("cleanup incomplete: %v", err)
+	klog.Infof("Removing: %s", cleanupPaths)
+	args := append([]string{"rm", "-rf"}, cleanupPaths...)
+	if _, err := d.exec.RunCmd(exec.Command("sudo", args...)); err != nil {
+		klog.Errorf("cleanup incomplete: %v", err)
 	}
 	return nil
 }
@@ -182,16 +211,22 @@ func (d *Driver) Start() error {
 
 // Stop a host gracefully, including any containers that we are managing.
 func (d *Driver) Stop() error {
-	if err := stopKubelet(d.exec); err != nil {
-		return err
+	if err := sysinit.New(d.exec).Stop("kubelet"); err != nil {
+		klog.Warningf("couldn't stop kubelet. will continue with stop anyways: %v", err)
+		if err := sysinit.New(d.exec).ForceStop("kubelet"); err != nil {
+			klog.Warningf("couldn't force stop kubelet. will continue with stop anyways: %v", err)
+		}
 	}
-	containers, err := d.runtime.ListContainers(cruntime.MinikubeContainerPrefix)
+	containers, err := d.runtime.ListContainers(cruntime.ListOptions{})
 	if err != nil {
 		return errors.Wrap(err, "containers")
 	}
-	if err := d.runtime.StopContainers(containers); err != nil {
-		return errors.Wrap(err, "stop")
+	if len(containers) > 0 {
+		if err := d.runtime.StopContainers(containers); err != nil {
+			return errors.Wrap(err, "stop containers")
+		}
 	}
+	klog.Infof("none driver is stopped!")
 	return nil
 }
 
@@ -200,20 +235,12 @@ func (d *Driver) RunSSHCommandFromDriver() error {
 	return fmt.Errorf("driver does not support ssh commands")
 }
 
-// stopKubelet idempotently stops the kubelet
-func stopKubelet(exec bootstrapper.CommandRunner) error {
-	glog.Infof("stopping kubelet.service ...")
-	return exec.Run("sudo systemctl stop kubelet.service")
-}
-
 // restartKubelet restarts the kubelet
-func restartKubelet(exec bootstrapper.CommandRunner) error {
-	glog.Infof("restarting kubelet.service ...")
-	return exec.Run("sudo systemctl restart kubelet.service")
-}
-
-// checkKubelet returns an error if the kubelet is not running.
-func checkKubelet(exec bootstrapper.CommandRunner) error {
-	glog.Infof("checking for running kubelet ...")
-	return exec.Run("systemctl is-active --quiet service kubelet")
+func restartKubelet(cr command.Runner) error {
+	klog.Infof("restarting kubelet.service ...")
+	c := exec.Command("sudo", "systemctl", "restart", "kubelet.service")
+	if _, err := cr.RunCmd(c); err != nil {
+		return err
+	}
+	return nil
 }

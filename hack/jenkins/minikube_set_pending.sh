@@ -24,19 +24,65 @@
 # ghprbActualCommit: The commit hash, injected from the ghpbr plugin.
 # access_token: The Github API access token. Injected by the Jenkins credential provider.
 
-set -e
-set +x
+set -eux -o pipefail
 
 if [ "${ghprbPullId}" == "master" ]; then
   echo "not setting github status for continuous builds"
   exit 0
 fi
 
-for job in "OSX-Virtualbox" "OSX-Hyperkit" "Linux-Virtualbox" "Linux-KVM" "Linux-None"; do
-  target_url="https://storage.googleapis.com/minikube-builds/logs/${ghprbPullId}/${job}.txt"
-  curl "https://api.github.com/repos/kubernetes/minikube/statuses/${ghprbActualCommit}?access_token=$access_token" \
-    -H "Content-Type: application/json" \
-    -X POST \
-    -d "{\"state\": \"pending\", \"description\": \"Jenkins\", \"target_url\": \"${target_url}\", \"context\": \"${job}\"}"
+jobs=(
+     'HyperKit_macOS'
+     'Hyper-V_Windows'
+     'VirtualBox_Linux'
+     'VirtualBox_macOS'
+     'VirtualBox_Windows'
+     # 'KVM-GPU_Linux' - Disabled
+     'KVM_Linux'
+     'none_Linux'
+     'Docker_Linux'
+     'Docker_macOS'
+     'Docker_Windows'
+     'Podman_Linux'
+)
+
+# retry_github_status provides reliable github status updates
+function retry_github_status() {
+  local commit=$1
+  local context=$2
+  local state=$3
+  local token=$4
+  local target=$5
+
+   # Retry in case we hit our GitHub API quota or fail other ways.
+  local attempt=0
+  local timeout=2
+  local code=-1
+
+  while [[ "${attempt}" -lt 8 ]]; do
+    local out=$(mktemp)
+    code=$(curl -o "${out}" -s --write-out "%{http_code}" -L \
+      "https://api.github.com/repos/kubernetes/minikube/statuses/${commit}?access_token=${token}" \
+      -H "Content-Type: application/json" \
+      -X POST \
+      -d "{\"state\": \"${state}\", \"description\": \"Jenkins\", \"target_url\": \"${target}\", \"context\": \"${context}\"}" || echo 999)
+
+    # 2xx HTTP codes
+    if [[ "${code}" =~ ^2 ]]; then
+      break
+    fi
+
+    cat "${out}" && rm -f "${out}"
+    echo "HTTP code ${code}! Retrying in ${timeout} .."
+    sleep "${timeout}"
+    attempt=$(( attempt + 1 ))
+    timeout=$(( timeout * 5 ))
+  done
+}
+
+SHORT_COMMIT=${ghprbActualCommit:0:7}
+for j in ${jobs[@]}; do
+  retry_github_status "${ghprbActualCommit}" "${j}" "pending" "${access_token}" \
+  "https://storage.googleapis.com/minikube-builds/logs/${ghprbPullId}/${SHORT_COMMIT}/${j}.pending"
 done
 

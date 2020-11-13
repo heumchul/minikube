@@ -17,131 +17,14 @@ limitations under the License.
 package util
 
 import (
-	"bytes"
-	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"sync"
+	"io/ioutil"
+	"os"
+	"os/user"
+	"syscall"
 	"testing"
 
-	"github.com/pkg/errors"
+	"github.com/blang/semver"
 )
-
-// Returns a function that will return n errors, then return successfully forever.
-func errorGenerator(n int, retryable bool) func() error {
-	errorCount := 0
-	return func() (err error) {
-		if errorCount < n {
-			errorCount += 1
-			e := errors.New("Error!")
-			if retryable {
-				return &RetriableError{Err: e}
-			} else {
-				return e
-			}
-
-		}
-
-		return nil
-	}
-}
-
-func TestErrorGenerator(t *testing.T) {
-	errors := 3
-	f := errorGenerator(errors, false)
-	for i := 0; i < errors-1; i++ {
-		if err := f(); err == nil {
-			t.Fatalf("Error should have been thrown at iteration %v", i)
-		}
-	}
-	if err := f(); err == nil {
-		t.Fatalf("Error should not have been thrown this call!")
-	}
-}
-
-func TestRetry(t *testing.T) {
-	f := errorGenerator(4, true)
-	if err := Retry(5, f); err != nil {
-		t.Fatalf("Error should not have been raised by retry.")
-	}
-
-	f = errorGenerator(5, true)
-	if err := Retry(4, f); err == nil {
-		t.Fatalf("Error should have been raised by retry.")
-	}
-}
-
-func TestRetryNotRetriableError(t *testing.T) {
-	f := errorGenerator(4, false)
-	if err := Retry(5, f); err == nil {
-		t.Fatalf("Error should have been raised by retry.")
-	}
-
-	f = errorGenerator(5, false)
-	if err := Retry(4, f); err == nil {
-		t.Fatalf("Error should have been raised by retry.")
-	}
-	f = errorGenerator(0, false)
-	if err := Retry(5, f); err != nil {
-		t.Fatalf("Error should not have been raised by retry.")
-	}
-}
-
-type getTestArgs struct {
-	input         string
-	expected      string
-	expectedError bool
-}
-
-var testSHAString = "test"
-
-func TestParseSHAFromURL(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, testSHAString)
-	}))
-	serverBadResponse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("500 HTTP status code returned!"))
-	}))
-
-	argsList := [...]getTestArgs{
-		{server.URL, testSHAString, false},
-		{serverBadResponse.URL, "", true},
-		{"abc", "", true},
-	}
-	for _, args := range argsList {
-		url, err := ParseSHAFromURL(args.input)
-		wasError := err != nil
-		if wasError != args.expectedError {
-			t.Errorf("ParseSHAFromURL Expected error was: %t, Actual Error was: %s",
-				args.expectedError, err)
-		}
-		if url != args.expected {
-			t.Errorf("ParseSHAFromURL: Expected %s, Actual: %s", args.expected, url)
-		}
-	}
-}
-
-func TestMultiError(t *testing.T) {
-	m := MultiError{}
-
-	m.Collect(errors.New("Error 1"))
-	m.Collect(errors.New("Error 2"))
-
-	err := m.ToError()
-	expected := `Error 1
-Error 2`
-	if err.Error() != expected {
-		t.Fatalf("%s != %s", err.Error(), expected)
-	}
-
-	m = MultiError{}
-	if err := m.ToError(); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-}
 
 func TestGetBinaryDownloadURL(t *testing.T) {
 	testData := []struct {
@@ -163,38 +46,151 @@ func TestGetBinaryDownloadURL(t *testing.T) {
 
 }
 
-func TestTeePrefix(t *testing.T) {
-	var in bytes.Buffer
-	var out bytes.Buffer
-	var logged strings.Builder
-
-	logSink := func(format string, args ...interface{}) {
-		logged.WriteString("(" + fmt.Sprintf(format, args...) + ")")
+func TestCalculateSizeInMB(t *testing.T) {
+	testData := []struct {
+		size           string
+		expectedNumber int
+	}{
+		{"1024kb", 1},
+		{"1024KB", 1},
+		{"1024mb", 1024},
+		{"1024b", 0},
+		{"1g", 1024},
 	}
 
-	// Simulate the primary use case: tee in the background. This also helps avoid I/O races.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		TeePrefix(":", &in, &out, logSink)
-		wg.Done()
+	for _, tt := range testData {
+		number, err := CalculateSizeInMB(tt.size)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if number != tt.expectedNumber {
+			t.Fatalf("Expected '%d' but got '%d' from size '%s'", tt.expectedNumber, number, tt.size)
+		}
+	}
+}
+
+func TestParseKubernetesVersion(t *testing.T) {
+	version, err := ParseKubernetesVersion("v1.8.0-alpha.5")
+	if err != nil {
+		t.Fatalf("Error parsing version: %v", err)
+	}
+	if version.NE(semver.MustParse("1.8.0-alpha.5")) {
+		t.Errorf("Expected: %s, Actual:%s", "1.8.0-alpha.5", version)
+	}
+}
+
+func TestChownR(t *testing.T) {
+	testDir, err := ioutil.TempDir(os.TempDir(), "")
+	if nil != err {
+		return
+	}
+	_, err = os.Create(testDir + "/TestChownR")
+	if nil != err {
+		return
+	}
+	defer func() { //clean up tempdir
+		err := os.RemoveAll(testDir)
+		if err != nil {
+			t.Errorf("failed to clean up temp folder  %q", testDir)
+		}
 	}()
 
-	in.Write([]byte("goo"))
-	in.Write([]byte("\n"))
-	in.Write([]byte("g\r\n\r\n"))
-	in.Write([]byte("le"))
-	wg.Wait()
+	cases := []struct {
+		name          string
+		uid           int
+		gid           int
+		expectedError bool
+	}{
+		{
+			name:          "normal",
+			uid:           os.Getuid(),
+			gid:           os.Getgid(),
+			expectedError: false,
+		},
+		{
+			name:          "invalid uid",
+			uid:           2147483647,
+			gid:           os.Getgid(),
+			expectedError: true,
+		},
+		{
+			name:          "invalid gid",
+			uid:           os.Getuid(),
+			gid:           2147483647,
+			expectedError: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err = ChownR(testDir+"/TestChownR", c.uid, c.gid)
+			fileInfo, _ := os.Stat(testDir + "/TestChownR")
+			fileSys := fileInfo.Sys()
+			if (nil != err) != c.expectedError || ((false == c.expectedError) && (fileSys.(*syscall.Stat_t).Gid != uint32(c.gid) || fileSys.(*syscall.Stat_t).Uid != uint32(c.uid))) {
+				t.Errorf("expectedError: %v, got: %v", c.expectedError, err)
+			}
+		})
+	}
+}
 
-	gotBytes := out.Bytes()
-	wantBytes := []byte("goo\ng\r\n\r\nle")
-	if !bytes.Equal(gotBytes, wantBytes) {
-		t.Errorf("output=%q, want: %q", gotBytes, wantBytes)
+func TestMaybeChownDirRecursiveToMinikubeUser(t *testing.T) {
+	testDir, err := ioutil.TempDir(os.TempDir(), "")
+	if nil != err {
+		return
+	}
+	_, err = os.Create(testDir + "/TestChownR")
+	if nil != err {
+		return
 	}
 
-	gotLog := logged.String()
-	wantLog := "(:goo)(:g)(:le)"
-	if gotLog != wantLog {
-		t.Errorf("log=%q, want: %q", gotLog, wantLog)
+	defer func() { //clean up tempdir
+		err := os.RemoveAll(testDir)
+		if err != nil {
+			t.Errorf("failed to clean up temp folder  %q", testDir)
+		}
+	}()
+
+	if os.Getenv("CHANGE_MINIKUBE_NONE_USER") == "" {
+		err = os.Setenv("CHANGE_MINIKUBE_NONE_USER", "1")
+		if nil != err {
+			t.Error("failed to set env: CHANGE_MINIKUBE_NONE_USER")
+		}
+	}
+
+	if os.Getenv("SUDO_USER") == "" {
+		user, err := user.Current()
+		if nil != err {
+			t.Error("fail to get user")
+		}
+		os.Setenv("SUDO_USER", user.Username)
+		err = os.Setenv("SUDO_USER", user.Username)
+		if nil != err {
+			t.Error("failed to set env: SUDO_USER")
+		}
+	}
+
+	cases := []struct {
+		name          string
+		dir           string
+		expectedError bool
+	}{
+		{
+			name:          "normal",
+			dir:           testDir,
+			expectedError: false,
+		},
+		{
+			name:          "invaild dir",
+			dir:           "./utils_test",
+			expectedError: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err = MaybeChownDirRecursiveToMinikubeUser(c.dir)
+			if (nil != err) != c.expectedError {
+				t.Errorf("expectedError: %v, got: %v", c.expectedError, err)
+			}
+		})
 	}
 }

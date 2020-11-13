@@ -19,10 +19,10 @@ package config
 import (
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
-	"k8s.io/minikube/pkg/minikube/config"
+	config "k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/out"
 )
 
 var configGetCmd = &cobra.Command{
@@ -30,13 +30,17 @@ var configGetCmd = &cobra.Command{
 	Short: "Gets the value of PROPERTY_NAME from the minikube config file",
 	Long:  "Returns the value of PROPERTY_NAME from the minikube config file.  Can be overwritten at runtime by flags or environmental variables.",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if len(args) != 1 {
+		if len(args) == 0 {
 			cmd.SilenceErrors = true
-			return errors.New("usage: minikube config get PROPERTY_NAME")
+			return errors.New("not enough arguments.\nusage: minikube config get PROPERTY_NAME")
+		}
+		if len(args) > 1 {
+			cmd.SilenceErrors = true
+			return fmt.Errorf("too many arguments (%d)\nusage: minikube config get PROPERTY_NAME", len(args))
 		}
 
 		cmd.SilenceUsage = true
-		val, err := config.Get(args[0])
+		val, err := Get(args[0])
 		if err != nil {
 			return err
 		}
@@ -44,11 +48,16 @@ var configGetCmd = &cobra.Command{
 			return fmt.Errorf("no value for key '%s'", args[0])
 		}
 
-		fmt.Fprintln(os.Stdout, val)
+		out.Ln(val)
 		return nil
 	},
 }
 
 func init() {
 	ConfigCmd.AddCommand(configGetCmd)
+}
+
+// Get gets a property
+func Get(name string) (string, error) {
+	return config.Get(name)
 }

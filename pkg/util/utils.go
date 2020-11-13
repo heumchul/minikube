@@ -17,126 +17,52 @@ limitations under the License.
 package util
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
-	"io"
-	"io/ioutil"
-	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
-	"strings"
-	"time"
 
+	"github.com/blang/semver"
 	units "github.com/docker/go-units"
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
 )
-
-const ErrPrefix = "! "
-const OutPrefix = "> "
 
 const (
 	downloadURL = "https://storage.googleapis.com/minikube/releases/%s/minikube-%s-amd64%s"
 )
 
-type RetriableError struct {
-	Err error
-}
-
-func (r RetriableError) Error() string { return "Temporary Error: " + r.Err.Error() }
-
-func CalculateDiskSizeInMB(humanReadableDiskSize string) int {
-	diskSize, err := units.FromHumanSize(humanReadableDiskSize)
+// CalculateSizeInMB returns the number of MB in the human readable string
+func CalculateSizeInMB(humanReadableSize string) (int, error) {
+	_, err := strconv.ParseInt(humanReadableSize, 10, 64)
+	if err == nil {
+		humanReadableSize += "mb"
+	}
+	// parse the size suffix binary instead of decimal so that 1G -> 1024MB instead of 1000MB
+	size, err := units.RAMInBytes(humanReadableSize)
 	if err != nil {
-		glog.Errorf("Invalid disk size: %v", err)
-	}
-	return int(diskSize / units.MB)
-}
-
-// Until endlessly loops the provided function until a message is received on the done channel.
-// The function will wait the duration provided in sleep between function calls. Errors will be sent on provider Writer.
-func Until(fn func() error, w io.Writer, name string, sleep time.Duration, done <-chan struct{}) {
-	var exitErr error
-	for {
-		select {
-		case <-done:
-			return
-		default:
-			exitErr = fn()
-			if exitErr == nil {
-				fmt.Fprintf(w, Pad("%s: Exited with no errors.\n"), name)
-			} else {
-				fmt.Fprintf(w, Pad("%s: Exit with error: %v"), name, exitErr)
-			}
-
-			// wait provided duration before trying again
-			time.Sleep(sleep)
-		}
-	}
-}
-
-func Pad(str string) string {
-	return fmt.Sprintf("\n%s\n", str)
-}
-
-// If the file represented by path exists and
-// readable, return true otherwise return false.
-func CanReadFile(path string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return false
+		return 0, fmt.Errorf("FromHumanSize: %v", err)
 	}
 
-	defer f.Close()
-
-	return true
+	return int(size / units.MiB), nil
 }
 
-func Retry(attempts int, callback func() error) (err error) {
-	return RetryAfter(attempts, callback, 0)
+// ConvertMBToBytes converts MB to bytes
+func ConvertMBToBytes(mbSize int) int64 {
+	return int64(mbSize) * units.MiB
 }
 
-func RetryAfter(attempts int, callback func() error, d time.Duration) (err error) {
-	m := MultiError{}
-	for i := 0; i < attempts; i++ {
-		if i > 0 {
-			glog.V(1).Infof("retry loop %d", i)
-		}
-		err = callback()
-		if err == nil {
-			return nil
-		}
-		m.Collect(err)
-		if _, ok := err.(*RetriableError); !ok {
-			glog.Infof("non-retriable error: %v", err)
-			return m.ToError()
-		}
-		glog.V(2).Infof("sleeping %s", d)
-		time.Sleep(d)
-	}
-	return m.ToError()
+// ConvertBytesToMB converts bytes to MB
+func ConvertBytesToMB(byteSize int64) int {
+	return int(ConvertUnsignedBytesToMB(uint64(byteSize)))
 }
 
-func ParseSHAFromURL(url string) (string, error) {
-	r, err := http.Get(url)
-	if err != nil {
-		return "", errors.Wrap(err, "Error downloading checksum.")
-	} else if r.StatusCode != http.StatusOK {
-		return "", errors.Errorf("Error downloading checksum. Got HTTP Error: %s", r.Status)
-	}
-
-	defer r.Body.Close()
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return "", errors.Wrap(err, "Error reading checksum.")
-	}
-
-	return strings.Trim(string(body), "\n"), nil
+// ConvertUnsignedBytesToMB converts bytes to MB
+func ConvertUnsignedBytesToMB(byteSize uint64) int64 {
+	return int64(byteSize / units.MiB)
 }
 
+// GetBinaryDownloadURL returns a suitable URL for the platform
 func GetBinaryDownloadURL(version, platform string) string {
 	switch platform {
 	case "windows":
@@ -146,36 +72,7 @@ func GetBinaryDownloadURL(version, platform string) string {
 	}
 }
 
-type MultiError struct {
-	Errors []error
-}
-
-func (m *MultiError) Collect(err error) {
-	if err != nil {
-		m.Errors = append(m.Errors, err)
-	}
-}
-
-func (m MultiError) ToError() error {
-	if len(m.Errors) == 0 {
-		return nil
-	}
-
-	errStrings := []string{}
-	for _, err := range m.Errors {
-		errStrings = append(errStrings, err.Error())
-	}
-	return errors.New(strings.Join(errStrings, "\n"))
-}
-
-func IsDirectory(path string) (bool, error) {
-	fileInfo, err := os.Stat(path)
-	if err != nil {
-		return false, errors.Wrapf(err, "Error calling os.Stat on file %s", path)
-	}
-	return fileInfo.IsDir(), nil
-}
-
+// ChownR does a recursive os.Chown
 func ChownR(path string, uid, gid int) error {
 	return filepath.Walk(path, func(name string, info os.FileInfo, err error) error {
 		if err == nil {
@@ -185,6 +82,7 @@ func ChownR(path string, uid, gid int) error {
 	})
 }
 
+// MaybeChownDirRecursiveToMinikubeUser changes ownership of a dir, if requested
 func MaybeChownDirRecursiveToMinikubeUser(dir string) error {
 	if os.Getenv("CHANGE_MINIKUBE_NONE_USER") != "" && os.Getenv("SUDO_USER") != "" {
 		username := os.Getenv("SUDO_USER")
@@ -207,30 +105,7 @@ func MaybeChownDirRecursiveToMinikubeUser(dir string) error {
 	return nil
 }
 
-// TeePrefix copies bytes from a reader to writer, logging each new line.
-func TeePrefix(prefix string, r io.Reader, w io.Writer, logger func(format string, args ...interface{})) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Split(bufio.ScanBytes)
-	var line bytes.Buffer
-
-	for scanner.Scan() {
-		b := scanner.Bytes()
-		if _, err := w.Write(b); err != nil {
-			return err
-		}
-
-		if bytes.IndexAny(b, "\r\n") == 0 {
-			if line.Len() > 0 {
-				logger("%s%s", prefix, line.String())
-				line.Reset()
-			}
-			continue
-		}
-		line.Write(b)
-	}
-	// Catch trailing output in case stream does not end with a newline
-	if line.Len() > 0 {
-		logger("%s%s", prefix, line.String())
-	}
-	return nil
+// ParseKubernetesVersion parses the Kubernetes version
+func ParseKubernetesVersion(version string) (semver.Version, error) {
+	return semver.Make(version[1:])
 }

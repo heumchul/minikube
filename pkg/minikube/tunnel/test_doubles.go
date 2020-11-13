@@ -19,7 +19,7 @@ package tunnel
 import (
 	"fmt"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/config"
 )
 
@@ -28,19 +28,19 @@ type recordingReporter struct {
 }
 
 func (r *recordingReporter) Report(tunnelState *Status) {
-	glog.V(4).Infof("recordingReporter.Report: %v", tunnelState)
+	klog.V(4).Infof("recordingReporter.Report: %v", tunnelState)
 	r.statesRecorded = append(r.statesRecorded, tunnelState)
 }
 
-//simulating idempotent router behavior
-//without checking for conflicting routes
+// simulating idempotent router behavior
+// without checking for conflicting routes
 type fakeRouter struct {
 	rt            routingTable
 	errorResponse error
 }
 
 func (r *fakeRouter) EnsureRouteIsAdded(route *Route) error {
-	glog.V(4).Infof("fakerouter.EnsureRouteIsAdded %s", route)
+	klog.V(4).Infof("fakerouter.EnsureRouteIsAdded %s", route)
 	if r.errorResponse == nil {
 		exists, err := isValidToAddOrDelete(r, route)
 		if err != nil {
@@ -57,7 +57,7 @@ func (r *fakeRouter) EnsureRouteIsAdded(route *Route) error {
 	return r.errorResponse
 }
 func (r *fakeRouter) Cleanup(route *Route) error {
-	glog.V(4).Infof("fake router cleanup: %v\n", route)
+	klog.V(4).Infof("fake router cleanup: %v\n", route)
 	if r.errorResponse == nil {
 		exists, err := isValidToAddOrDelete(r, route)
 		if err != nil {
@@ -82,10 +82,14 @@ func (r *fakeRouter) Inspect(route *Route) (exists bool, conflict string, overla
 }
 
 type stubConfigLoader struct {
-	c *config.Config
+	c *config.ClusterConfig
 	e error
 }
 
-func (l *stubConfigLoader) LoadConfigFromFile(profile string) (*config.Config, error) {
+func (l *stubConfigLoader) WriteConfigToFile(profileName string, cc *config.ClusterConfig, miniHome ...string) error {
+	return l.e
+}
+
+func (l *stubConfigLoader) LoadConfigFromFile(profile string, miniHome ...string) (*config.ClusterConfig, error) {
 	return l.c, l.e
 }

@@ -23,17 +23,16 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/ioutil"
-	"net/http"
 	"testing"
 
-	"k8s.io/minikube/pkg/minikube/constants"
+	retryablehttp "github.com/hashicorp/go-retryablehttp"
 	"k8s.io/minikube/pkg/minikube/notify"
 	"k8s.io/minikube/pkg/util"
 )
 
-func getShaFromURL(url string) (string, error) {
+func getSHAFromURL(url string) (string, error) {
 	fmt.Println("Downloading: ", url)
-	r, err := http.Get(url)
+	r, err := retryablehttp.Get(url)
 	if err != nil {
 		return "", err
 	}
@@ -47,8 +46,8 @@ func getShaFromURL(url string) (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-func TestReleasesJson(t *testing.T) {
-	releases, err := notify.GetAllVersionsFromURL(constants.GithubMinikubeReleasesURL)
+func TestReleasesJSON(t *testing.T) {
+	releases, err := notify.GetAllVersionsFromURL(notify.GithubMinikubeReleasesURL)
 	if err != nil {
 		t.Fatalf("Error getting releases.json: %v", err)
 	}
@@ -57,7 +56,7 @@ func TestReleasesJson(t *testing.T) {
 		fmt.Printf("Checking release: %s\n", r.Name)
 		for platform, sha := range r.Checksums {
 			fmt.Printf("Checking SHA for %s.\n", platform)
-			actualSha, err := getShaFromURL(util.GetBinaryDownloadURL(r.Name, platform))
+			actualSha, err := getSHAFromURL(util.GetBinaryDownloadURL(r.Name, platform))
 			if err != nil {
 				t.Errorf("Error calculating SHA for %s-%s. Error: %v", r.Name, platform, err)
 				continue

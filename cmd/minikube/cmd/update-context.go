@@ -17,52 +17,39 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
-	"os"
-
-	"github.com/golang/glog"
 	"github.com/spf13/cobra"
-	cmdUtil "k8s.io/minikube/cmd/util"
-	"k8s.io/minikube/pkg/minikube/cluster"
-	"k8s.io/minikube/pkg/minikube/config"
-	"k8s.io/minikube/pkg/minikube/constants"
-	"k8s.io/minikube/pkg/minikube/machine"
-	kcfg "k8s.io/minikube/pkg/util/kubeconfig"
+	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/kubeconfig"
+	"k8s.io/minikube/pkg/minikube/mustload"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 // updateContextCmd represents the update-context command
 var updateContextCmd = &cobra.Command{
 	Use:   "update-context",
-	Short: "Verify the IP address of the running cluster in kubeconfig.",
+	Short: "Update kubeconfig in case of an IP or port change",
 	Long: `Retrieves the IP address of the running cluster, checks it
 			with IP in kubeconfig, and corrects kubeconfig if incorrect.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		api, err := machine.NewAPIClient()
+		cname := ClusterFlagValue()
+		co := mustload.Running(cname)
+
+		updated, err := kubeconfig.UpdateEndpoint(cname, co.CP.Hostname, co.CP.Port, kubeconfig.PathFromEnv())
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting client: %v\n", err)
-			os.Exit(1)
+			exit.Error(reason.HostKubeconfigUpdate, "update config", err)
 		}
-		defer api.Close()
-		machineName := config.GetMachineName()
-		ip, err := cluster.GetHostDriverIP(api, machineName)
-		if err != nil {
-			glog.Errorln("Error host driver ip status:", err)
-			cmdUtil.MaybeReportErrorAndExit(err)
-		}
-		ok, err := kcfg.UpdateKubeconfigIP(ip, constants.KubeconfigPath, machineName)
-		if err != nil {
-			glog.Errorln("Error kubeconfig status:", err)
-			cmdUtil.MaybeReportErrorAndExit(err)
-		}
-		if ok {
-			fmt.Println("Reconfigured kubeconfig IP, now pointing at " + ip.String())
+		if updated {
+			out.T(style.Celebrate, `"{{.context}}" context has been updated to point to {{.hostname}}:{{.port}}`, out.V{"context": cname, "hostname": co.CP.Hostname, "port": co.CP.Port})
 		} else {
-			fmt.Println("Kubeconfig IP correctly configured, pointing at " + ip.String())
+			out.T(style.Meh, `No changes required for the "{{.context}}" context`, out.V{"context": cname})
 		}
 
+		if err := kubeconfig.SetCurrentContext(cname, kubeconfig.PathFromEnv()); err != nil {
+			out.ErrT(style.Sad, `Error while setting kubectl current context:  {{.error}}`, out.V{"error": err})
+		} else {
+			out.T(style.Kubectl, `Current context is "{{.context}}"`, out.V{"context": cname})
+		}
 	},
-}
-
-func init() {
-	RootCmd.AddCommand(updateContextCmd)
 }

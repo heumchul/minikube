@@ -20,52 +20,102 @@ package integration
 
 import (
 	"context"
-	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
-	"time"
 )
 
-func TestDocker(t *testing.T) {
-	mk := NewMinikubeRunner(t)
-	if strings.Contains(mk.StartArgs, "--vm-driver=none") {
-		t.Skip("skipping test as none driver does not bundle docker")
+func TestDockerFlags(t *testing.T) {
+	if NoneDriver() {
+		t.Skip("skipping: none driver does not support ssh or bundle docker")
+	}
+	MaybeParallel(t)
+
+	profile := UniqueProfileName("docker-flags")
+	ctx, cancel := context.WithTimeout(context.Background(), Minutes(30))
+	defer CleanupWithLogs(t, profile, cancel)
+
+	// Use the most verbose logging for the simplest test. If it fails, something is very wrong.
+	args := append([]string{"start", "-p", profile, "--cache-images=false", "--memory=1800", "--install-addons=false", "--wait=false", "--docker-env=FOO=BAR", "--docker-env=BAZ=BAT", "--docker-opt=debug", "--docker-opt=icc=true", "--alsologtostderr", "-v=5"}, StartArgs()...)
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), args...))
+	if err != nil {
+		t.Errorf("failed to start minikube with args: %q : %v", rr.Command(), err)
 	}
 
-	// Start a timer for all remaining commands, to display failure output before a panic.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	// Pre-cleanup: this usually fails, because no instance is running.
-	mk.RunWithContext(ctx, "delete")
-
-	startCmd := fmt.Sprintf("start %s %s %s", mk.StartArgs, mk.Args,
-		"--docker-env=FOO=BAR --docker-env=BAZ=BAT --docker-opt=debug --docker-opt=icc=true --alsologtostderr --v=5")
-	stdout, stderr, err := mk.RunWithContext(ctx, startCmd)
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "ssh", "sudo systemctl show docker --property=Environment --no-pager"))
 	if err != nil {
-		t.Fatalf("start: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
-	}
-
-	mk.EnsureRunning()
-
-	stdout, stderr, err = mk.RunWithContext(ctx, "ssh -- systemctl show docker --property=Environment --no-pager")
-	if err != nil {
-		t.Errorf("docker env: %v\nstderr: %s", err, stderr)
+		t.Errorf("failed to 'systemctl show docker' inside minikube. args %q: %v", rr.Command(), err)
 	}
 
 	for _, envVar := range []string{"FOO=BAR", "BAZ=BAT"} {
-		if !strings.Contains(stdout, envVar) {
-			t.Errorf("Env var %s missing: %s.", envVar, stdout)
+		if !strings.Contains(rr.Stdout.String(), envVar) {
+			t.Errorf("expected env key/value %q to be passed to minikube's docker and be included in: *%q*.", envVar, rr.Stdout)
 		}
 	}
 
-	stdout, stderr, err = mk.RunWithContext(ctx, "ssh -- systemctl show docker --property=ExecStart --no-pager")
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "ssh", "sudo systemctl show docker --property=ExecStart --no-pager"))
 	if err != nil {
-		t.Errorf("ssh show docker: %v\nstderr: %s", err, stderr)
+		t.Errorf("failed on the second 'systemctl show docker' inside minikube. args %q: %v", rr.Command(), err)
 	}
 	for _, opt := range []string{"--debug", "--icc=true"} {
-		if !strings.Contains(stdout, opt) {
-			t.Fatalf("Option %s missing from ExecStart: %s.", opt, stdout)
+		if !strings.Contains(rr.Stdout.String(), opt) {
+			t.Fatalf("expected %q output to have include *%s* . output: %q", rr.Command(), opt, rr.Stdout)
 		}
+	}
+}
+
+func TestForceSystemdFlag(t *testing.T) {
+	if NoneDriver() {
+		t.Skip("skipping: none driver does not support ssh or bundle docker")
+	}
+	MaybeParallel(t)
+
+	profile := UniqueProfileName("force-systemd-flag")
+	ctx, cancel := context.WithTimeout(context.Background(), Minutes(30))
+	defer CleanupWithLogs(t, profile, cancel)
+
+	// Use the most verbose logging for the simplest test. If it fails, something is very wrong.
+	args := append([]string{"start", "-p", profile, "--memory=1800", "--force-systemd", "--alsologtostderr", "-v=5"}, StartArgs()...)
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), args...))
+	if err != nil {
+		t.Errorf("failed to start minikube with args: %q : %v", rr.Command(), err)
+	}
+
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "ssh", "docker info --format {{.CgroupDriver}}"))
+	if err != nil {
+		t.Errorf("failed to get docker cgroup driver. args %q: %v", rr.Command(), err)
+	}
+
+	if !strings.Contains(rr.Output(), "systemd") {
+		t.Fatalf("expected systemd cgroup driver, got: %v", rr.Output())
+	}
+}
+
+func TestForceSystemdEnv(t *testing.T) {
+	if NoneDriver() {
+		t.Skip("skipping: none driver does not support ssh or bundle docker")
+	}
+	MaybeParallel(t)
+
+	profile := UniqueProfileName("force-systemd-env")
+	ctx, cancel := context.WithTimeout(context.Background(), Minutes(30))
+	defer CleanupWithLogs(t, profile, cancel)
+
+	args := append([]string{"start", "-p", profile, "--memory=1800", "--alsologtostderr", "-v=5"}, StartArgs()...)
+	cmd := exec.CommandContext(ctx, Target(), args...)
+	cmd.Env = append(os.Environ(), "MINIKUBE_FORCE_SYSTEMD=true")
+	rr, err := Run(t, cmd)
+	if err != nil {
+		t.Errorf("failed to start minikube with args: %q : %v", rr.Command(), err)
+	}
+
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "ssh", "docker info --format {{.CgroupDriver}}"))
+	if err != nil {
+		t.Errorf("failed to get docker cgroup driver. args %q: %v", rr.Command(), err)
+	}
+
+	if !strings.Contains(rr.Output(), "systemd") {
+		t.Fatalf("expected systemd cgroup driver, got: %v", rr.Output())
 	}
 }

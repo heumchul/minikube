@@ -17,19 +17,27 @@ limitations under the License.
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
-	"text/template"
+	"strings"
 
-	"github.com/golang/glog"
+	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/assets"
-	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/mustload"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
-var addonListFormat string
+var addonListOutput string
 
+// AddonListTemplate represents the addon list template
 type AddonListTemplate struct {
 	AddonName   string
 	AddonStatus string
@@ -41,55 +49,97 @@ var addonsListCmd = &cobra.Command{
 	Long:  "Lists all available minikube addons as well as their current statuses (enabled/disabled)",
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) != 0 {
-			fmt.Fprintln(os.Stderr, "usage: minikube addons list")
-			os.Exit(1)
+			exit.Message(reason.Usage, "usage: minikube addons list")
 		}
-		err := addonList()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+
+		_, cc := mustload.Partial(ClusterFlagValue())
+		switch strings.ToLower(addonListOutput) {
+		case "list":
+			printAddonsList(cc)
+		case "json":
+			printAddonsJSON(cc)
+		default:
+			exit.Message(reason.Usage, fmt.Sprintf("invalid output format: %s. Valid values: 'list', 'json'", addonListOutput))
 		}
 	},
 }
 
 func init() {
-	AddonsCmd.Flags().StringVar(&addonListFormat, "format", constants.DefaultAddonListFormat,
-		`Go template format string for the addon list output.  The format for Go templates can be found here: https://golang.org/pkg/text/template/
-For the list of accessible variables for the template, see the struct values here: https://godoc.org/k8s.io/minikube/cmd/minikube/cmd/config#AddonListTemplate`)
+	addonsListCmd.Flags().StringVarP(
+		&addonListOutput,
+		"output",
+		"o",
+		"list",
+		`minikube addons list --output OUTPUT. json, list`)
+
 	AddonsCmd.AddCommand(addonsListCmd)
 }
 
-func stringFromStatus(addonStatus bool) string {
+var iconFromStatus = func(addonStatus bool) string {
+	if addonStatus {
+		return "✅"
+	}
+	return "   " // because emoji indentation is different
+}
+
+var stringFromStatus = func(addonStatus bool) string {
 	if addonStatus {
 		return "enabled"
 	}
 	return "disabled"
 }
 
-func addonList() error {
+var printAddonsList = func(cc *config.ClusterConfig) {
 	addonNames := make([]string, 0, len(assets.Addons))
 	for addonName := range assets.Addons {
 		addonNames = append(addonNames, addonName)
 	}
 	sort.Strings(addonNames)
 
+	var tData [][]string
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"Addon Name", "Profile", "Status"})
+	table.SetAutoFormatHeaders(true)
+	table.SetBorders(tablewriter.Border{Left: true, Top: true, Right: true, Bottom: true})
+	table.SetCenterSeparator("|")
+
 	for _, addonName := range addonNames {
 		addonBundle := assets.Addons[addonName]
-		addonStatus, err := addonBundle.IsEnabled()
-		if err != nil {
-			return err
-		}
-		tmpl, err := template.New("list").Parse(addonListFormat)
-		if err != nil {
-			glog.Errorln("Error creating list template:", err)
-			os.Exit(1)
-		}
-		listTmplt := AddonListTemplate{addonName, stringFromStatus(addonStatus)}
-		err = tmpl.Execute(os.Stdout, listTmplt)
-		if err != nil {
-			glog.Errorln("Error executing list template:", err)
-			os.Exit(1)
+		enabled := addonBundle.IsEnabled(cc)
+		tData = append(tData, []string{addonName, cc.Name, fmt.Sprintf("%s %s", stringFromStatus(enabled), iconFromStatus(enabled))})
+	}
+
+	table.AppendBulk(tData)
+	table.Render()
+
+	v, _, err := config.ListProfiles()
+	if err != nil {
+		klog.Errorf("list profiles returned error: %v", err)
+	}
+	if len(v) > 1 {
+		out.T(style.Tip, "To see addons list for other profiles use: `minikube addons -p name list`")
+	}
+}
+
+var printAddonsJSON = func(cc *config.ClusterConfig) {
+	addonNames := make([]string, 0, len(assets.Addons))
+	for addonName := range assets.Addons {
+		addonNames = append(addonNames, addonName)
+	}
+	sort.Strings(addonNames)
+
+	addonsMap := map[string]map[string]interface{}{}
+
+	for _, addonName := range addonNames {
+		addonBundle := assets.Addons[addonName]
+		enabled := addonBundle.IsEnabled(cc)
+
+		addonsMap[addonName] = map[string]interface{}{
+			"Status":  stringFromStatus(enabled),
+			"Profile": cc.Name,
 		}
 	}
-	return nil
+	jsonString, _ := json.Marshal(addonsMap)
+
+	out.String(string(jsonString))
 }

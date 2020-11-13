@@ -17,27 +17,57 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
+	"encoding/json"
 
 	"github.com/spf13/cobra"
-
+	"gopkg.in/yaml.v2"
+	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 	"k8s.io/minikube/pkg/version"
+)
+
+var (
+	versionOutput string
+	shortVersion  bool
 )
 
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print the version of minikube",
 	Long:  `Print the version of minikube.`,
-	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		// Explicitly disable update checking for the version command
-		enableUpdateNotification = false
-	},
 	Run: func(command *cobra.Command, args []string) {
-
-		fmt.Println("minikube version:", version.GetVersion())
+		minikubeVersion := version.GetVersion()
+		gitCommitID := version.GetGitCommitID()
+		data := map[string]string{
+			"minikubeVersion": minikubeVersion,
+			"commit":          gitCommitID,
+		}
+		switch versionOutput {
+		case "":
+			out.Ln("minikube version: %v", minikubeVersion)
+			if !shortVersion && gitCommitID != "" {
+				out.Ln("commit: %v", gitCommitID)
+			}
+		case "json":
+			json, err := json.Marshal(data)
+			if err != nil {
+				exit.Error(reason.InternalJSONMarshal, "version json failure", err)
+			}
+			out.Ln(string(json))
+		case "yaml":
+			yaml, err := yaml.Marshal(data)
+			if err != nil {
+				exit.Error(reason.InternalYamlMarshal, "version yaml failure", err)
+			}
+			out.Ln(string(yaml))
+		default:
+			exit.Message(reason.InternalOutputUsage, "error: --output must be 'yaml' or 'json'")
+		}
 	},
 }
 
 func init() {
-	RootCmd.AddCommand(versionCmd)
+	versionCmd.Flags().StringVarP(&versionOutput, "output", "o", "", "One of 'yaml' or 'json'.")
+	versionCmd.Flags().BoolVar(&shortVersion, "short", false, "Print just the version number.")
 }

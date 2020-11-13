@@ -1,16 +1,25 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
 reviewers:
-  - dlorenc
-  - balopat
   - tstromberg
-  - priyawadhwa
   - afbjorklund
+  - sharifelgamal
+  - RA489
+  - medyagh
+  - josedonizetti
+  - blueelvis
+  - priyawadhwa
+  - prasadkatti
+  - ilya-zuyev
 approvers:
+  - tstromberg
+  - afbjorklund
+  - sharifelgamal
+  - medyagh
+  - josedonizetti
+  - priyawadhwa
+emeritus_approvers:
   - dlorenc
   - luxas
   - jimmidyson
-  - balopat
-  - tstromberg
-  - priyawadhwa
-  - afbjorklund
+  - r2d4

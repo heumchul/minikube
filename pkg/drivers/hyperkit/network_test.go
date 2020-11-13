@@ -1,3 +1,5 @@
+// +build darwin
+
 /*
 Copyright 2016 The Kubernetes Authors All rights reserved.
 
@@ -18,7 +20,6 @@ package hyperkit
 
 import (
 	"io/ioutil"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -49,13 +50,17 @@ var validLeases = []byte(`{
 
 func Test_getIpAddressFromFile(t *testing.T) {
 	tmpdir := tests.MakeTempDir()
-	defer os.RemoveAll(tmpdir)
+	defer tests.RemoveTempDir(tmpdir)
 
 	dhcpFile := filepath.Join(tmpdir, "dhcp")
-	ioutil.WriteFile(dhcpFile, validLeases, 0644)
+	if err := ioutil.WriteFile(dhcpFile, validLeases, 0644); err != nil {
+		t.Fatalf("writefile: %v", err)
+	}
 
 	invalidFile := filepath.Join(tmpdir, "invalid")
-	ioutil.WriteFile(invalidFile, []byte("foo"), 0644)
+	if err := ioutil.WriteFile(invalidFile, []byte("foo"), 0644); err != nil {
+		t.Fatalf("writefile: %v", err)
+	}
 
 	type args struct {
 		mac  string
@@ -88,13 +93,13 @@ func Test_getIpAddressFromFile(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := getIpAddressFromFile(tt.args.mac, tt.args.path)
+			got, err := getIPAddressFromFile(tt.args.mac, tt.args.path)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("getIpAddressFromFile() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("getIPAddressFromFile() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if got != tt.want {
-				t.Errorf("getIpAddressFromFile() = %v, want %v", got, tt.want)
+				t.Errorf("getIPAddressFromFile() = %v, want %v", got, tt.want)
 			}
 		})
 	}

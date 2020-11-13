@@ -28,10 +28,15 @@ set -e
 
 OS_ARCH="darwin-amd64"
 VM_DRIVER="hyperkit"
-JOB_NAME="OSX-Hyperkit"
+JOB_NAME="HyperKit_macOS"
 EXTRA_ARGS="--bootstrapper=kubeadm"
 EXTRA_START_ARGS=""
+EXPECTED_DEFAULT_DRIVER="hyperkit"
 
 
-# Download files and set permissions
+mkdir -p cron && gsutil -qm rsync "gs://minikube-builds/${MINIKUBE_LOCATION}/cron" cron || echo "FAILED TO GET CRON FILES"
+install cron/cleanup_and_reboot_Darwin.sh $HOME/cleanup_and_reboot.sh || echo "FAILED TO INSTALL CLEANUP"
+echo "*/30 * * * * $HOME/cleanup_and_reboot.sh" | crontab
+crontab -l
+
 source common.sh

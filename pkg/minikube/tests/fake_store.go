@@ -17,13 +17,16 @@ limitations under the License.
 package tests
 
 import (
+	"testing"
+
 	"github.com/docker/machine/libmachine/host"
 	"github.com/docker/machine/libmachine/mcnerror"
 )
 
-//implements persist.Store from libmachine
+// FakeStore implements persist.Store from libmachine
 type FakeStore struct {
 	Hosts map[string]*host.Host
+	T     *testing.T
 }
 
 // Exists determines if the host already exists.
@@ -32,6 +35,7 @@ func (s *FakeStore) Exists(name string) (bool, error) {
 	return ok, nil
 }
 
+// List returns the list of hosts.
 func (s *FakeStore) List() ([]string, error) {
 	hostNames := []string{}
 	for h := range s.Hosts {
@@ -66,7 +70,7 @@ func (s *FakeStore) Remove(name string) error {
 }
 
 // Save persists a machine in the store
-func (s *FakeStore) Save(host *host.Host) error {
-	s.Hosts[host.Name] = host
+func (s *FakeStore) Save(h *host.Host) error {
+	s.Hosts[h.Name] = h
 	return nil
 }

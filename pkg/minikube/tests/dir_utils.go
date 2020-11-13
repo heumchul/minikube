@@ -17,14 +17,16 @@ limitations under the License.
 package tests
 
 import (
+	"bytes"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 
-	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/minikube/localpath"
 )
 
+// MakeTempDir creates the temp dir and returns the path
 func MakeTempDir() string {
 	tempDir, err := ioutil.TempDir("", "minipath")
 	if err != nil {
@@ -39,6 +41,36 @@ func MakeTempDir() string {
 	if err != nil {
 		log.Fatal(err)
 	}
-	os.Setenv(constants.MinikubeHome, tempDir)
-	return constants.GetMinipath()
+	os.Setenv(localpath.MinikubeHome, tempDir)
+	return localpath.MiniPath()
+}
+
+// RemoveTempDir removes the temp dir
+func RemoveTempDir(tempdir string) {
+	if filepath.Base(tempdir) == ".minikube" {
+		tempdir = filepath.Dir(tempdir)
+	}
+	os.RemoveAll(tempdir)
+}
+
+// FakeFile satisfies fdWriter
+type FakeFile struct {
+	b bytes.Buffer
+}
+
+// NewFakeFile creates a FakeFile
+func NewFakeFile() *FakeFile {
+	return &FakeFile{}
+}
+
+// Fd returns the file descriptor
+func (f *FakeFile) Fd() uintptr {
+	return uintptr(0)
+}
+
+func (f *FakeFile) Write(p []byte) (int, error) {
+	return f.b.Write(p)
+}
+func (f *FakeFile) String() string {
+	return f.b.String()
 }

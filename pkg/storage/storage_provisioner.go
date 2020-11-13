@@ -21,16 +21,16 @@ import (
 	"os"
 	"path"
 
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
-	"github.com/r2d4/external-storage/lib/controller"
-	"k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	core "k8s.io/api/core/v1"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v5/controller"
 )
 
 const provisionerName = "k8s.io/minikube-hostpath"
@@ -44,9 +44,10 @@ type hostPathProvisioner struct {
 	identity types.UID
 }
 
-func NewHostPathProvisioner() controller.Provisioner {
+// NewHostPathProvisioner creates a new Provisioner using host paths
+func NewHostPathProvisioner(pvDir string) controller.Provisioner {
 	return &hostPathProvisioner{
-		pvDir:    "/tmp/hostpath-provisioner",
+		pvDir:    pvDir,
 		identity: uuid.NewUUID(),
 	}
 }
@@ -54,9 +55,9 @@ func NewHostPathProvisioner() controller.Provisioner {
 var _ controller.Provisioner = &hostPathProvisioner{}
 
 // Provision creates a storage asset and returns a PV object representing it.
-func (p *hostPathProvisioner) Provision(options controller.VolumeOptions) (*v1.PersistentVolume, error) {
-	glog.Infof("Provisioning volume %v", options)
-	path := path.Join(p.pvDir, options.PVName)
+func (p *hostPathProvisioner) Provision(options controller.ProvisionOptions) (*core.PersistentVolume, error) {
+	path := path.Join(p.pvDir, options.PVC.Namespace, options.PVC.Name)
+	klog.Infof("Provisioning volume %v to %s", options, path)
 	if err := os.MkdirAll(path, 0777); err != nil {
 		return nil, err
 	}
@@ -66,21 +67,21 @@ func (p *hostPathProvisioner) Provision(options controller.VolumeOptions) (*v1.P
 		return nil, err
 	}
 
-	pv := &v1.PersistentVolume{
-		ObjectMeta: metav1.ObjectMeta{
+	pv := &core.PersistentVolume{
+		ObjectMeta: meta.ObjectMeta{
 			Name: options.PVName,
 			Annotations: map[string]string{
 				"hostPathProvisionerIdentity": string(p.identity),
 			},
 		},
-		Spec: v1.PersistentVolumeSpec{
-			PersistentVolumeReclaimPolicy: options.PersistentVolumeReclaimPolicy,
+		Spec: core.PersistentVolumeSpec{
+			PersistentVolumeReclaimPolicy: *options.StorageClass.ReclaimPolicy,
 			AccessModes:                   options.PVC.Spec.AccessModes,
-			Capacity: v1.ResourceList{
-				v1.ResourceName(v1.ResourceStorage): options.PVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)],
+			Capacity: core.ResourceList{
+				core.ResourceStorage: options.PVC.Spec.Resources.Requests[core.ResourceStorage],
 			},
-			PersistentVolumeSource: v1.PersistentVolumeSource{
-				HostPath: &v1.HostPathVolumeSource{
+			PersistentVolumeSource: core.PersistentVolumeSource{
+				HostPath: &core.HostPathVolumeSource{
 					Path: path,
 				},
 			},
@@ -92,52 +93,51 @@ func (p *hostPathProvisioner) Provision(options controller.VolumeOptions) (*v1.P
 
 // Delete removes the storage asset that was created by Provision represented
 // by the given PV.
-func (p *hostPathProvisioner) Delete(volume *v1.PersistentVolume) error {
-	glog.Infof("Deleting volume %v", volume)
+func (p *hostPathProvisioner) Delete(volume *core.PersistentVolume) error {
+	klog.Infof("Deleting volume %v", volume)
 	ann, ok := volume.Annotations["hostPathProvisionerIdentity"]
 	if !ok {
 		return errors.New("identity annotation not found on PV")
 	}
 	if ann != string(p.identity) {
-		return &controller.IgnoredError{"identity annotation on PV does not match ours"}
+		return &controller.IgnoredError{Reason: "identity annotation on PV does not match ours"}
 	}
 
-	path := path.Join(p.pvDir, volume.Name)
-	if err := os.RemoveAll(path); err != nil {
+	if err := os.RemoveAll(volume.Spec.PersistentVolumeSource.HostPath.Path); err != nil {
 		return errors.Wrap(err, "removing hostpath PV")
 	}
 
 	return nil
 }
 
-// Start storage provisioner server
-func StartStorageProvisioner() error {
-	glog.Infof("Initializing the Minikube storage provisioner...")
-	config, err := restclient.InClusterConfig()
+// StartStorageProvisioner will start storage provisioner server
+func StartStorageProvisioner(pvDir string) error {
+	klog.Infof("Initializing the minikube storage provisioner...")
+	config, err := rest.InClusterConfig()
 	if err != nil {
 		return err
 	}
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		glog.Fatalf("Failed to create client: %v", err)
+		klog.Fatalf("Failed to create client: %v", err)
 	}
 
 	// The controller needs to know what the server version is because out-of-tree
 	// provisioners aren't officially supported until 1.5
 	serverVersion, err := clientset.Discovery().ServerVersion()
 	if err != nil {
-		return fmt.Errorf("Error getting server version: %v", err)
+		return fmt.Errorf("error getting server version: %v", err)
 	}
 
 	// Create the provisioner: it implements the Provisioner interface expected by
 	// the controller
-	hostPathProvisioner := NewHostPathProvisioner()
+	hostPathProvisioner := NewHostPathProvisioner(pvDir)
 
 	// Start the provision controller which will dynamically provision hostPath
 	// PVs
 	pc := controller.NewProvisionController(clientset, provisionerName, hostPathProvisioner, serverVersion.GitVersion)
 
-	glog.Info("Storage provisioner initialized, now starting service!")
+	klog.Info("Storage provisioner initialized, now starting service!")
 	pc.Run(wait.NeverStop)
 	return nil
 }

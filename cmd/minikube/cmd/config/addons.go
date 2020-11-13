@@ -18,13 +18,18 @@ package config
 
 import (
 	"github.com/spf13/cobra"
+
+	"k8s.io/klog/v2"
 )
 
+// AddonsCmd represents the addons command
 var AddonsCmd = &cobra.Command{
 	Use:   "addons SUBCOMMAND [flags]",
-	Short: "Modify minikube's kubernetes addons",
-	Long:  `addons modifies minikube addons files using subcommands like "minikube addons enable heapster"`,
+	Short: "Enable or disable a minikube addon",
+	Long:  `addons modifies minikube addons files using subcommands like "minikube addons enable dashboard"`,
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Help()
+		if err := cmd.Help(); err != nil {
+			klog.Errorf("help: %v", err)
+		}
 	},
 }

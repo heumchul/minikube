@@ -23,13 +23,14 @@ import (
 	"os"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
+
+	"k8s.io/klog/v2"
 )
 
 func TestTunnelManagerEventHandling(t *testing.T) {
 	tcs := []struct {
-		//tunnel inputs
+		// tunnel inputs
 		name   string
 		repeat int
 		test   func(tunnel *tunnelStub, cancel context.CancelFunc, ready, check, done chan bool) error
@@ -41,14 +42,14 @@ func TestTunnelManagerEventHandling(t *testing.T) {
 				tunnel.mockClusterInfo = &Status{
 					MinikubeState: Stopped,
 				}
-				glog.Info("waiting for tunnel to be ready.")
+				klog.Info("waiting for tunnel to be ready.")
 				<-ready
-				glog.Info("check!")
+				klog.Info("check!")
 				check <- true
-				glog.Info("check done.")
+				klog.Info("check done.")
 				select {
 				case <-done:
-					glog.Info("it's done, yay!")
+					klog.Info("it's done, yay!")
 				case <-time.After(1 * time.Second):
 					t.Error("tunnel did not stop on stopped minikube")
 				}
@@ -120,7 +121,7 @@ func TestTunnelManagerEventHandling(t *testing.T) {
 		},
 	}
 
-	//t.Parallel()
+	// t.Parallel()
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			var err error
@@ -136,7 +137,7 @@ func TestTunnelManagerEventHandling(t *testing.T) {
 				go tunnelManager.run(ctx, tunnel, ready, check, done)
 				err = tc.test(tunnel, cancel, ready, check, done)
 				if err != nil {
-					glog.Errorf("error at %d", i)
+					klog.Errorf("error at %d", i)
 				}
 			}
 		})
@@ -171,10 +172,7 @@ func TestTunnelManagerDelayAndContext(t *testing.T) {
 	}
 }
 
-func TestTunnelManagerCleanup(t *testing.T) {
-	reg, cleanup := createTestRegistry(t)
-	defer cleanup()
-
+func registerRunningTunnels(reg *persistentRegistry) (*ID, *ID, error) {
 	runningTunnel1 := &ID{
 		Route:       unsafeParseRoute("1.2.3.4", "5.6.7.8/9"),
 		Pid:         os.Getpid(),
@@ -187,6 +185,19 @@ func TestTunnelManagerCleanup(t *testing.T) {
 		MachineName: "minikube",
 	}
 
+	err := reg.Register(runningTunnel1)
+	if err != nil {
+		return runningTunnel1, runningTunnel2, err
+	}
+	err = reg.Register(runningTunnel2)
+	if err != nil {
+		return runningTunnel1, runningTunnel2, err
+	}
+
+	return runningTunnel1, runningTunnel2, nil
+}
+
+func registerNotRunningTunnels(reg *persistentRegistry) (*ID, *ID, error) {
 	notRunningTunnel1 := &ID{
 		Route:       unsafeParseRoute("200.2.3.4", "10.6.7.8/9"),
 		Pid:         12341234,
@@ -198,19 +209,28 @@ func TestTunnelManagerCleanup(t *testing.T) {
 		Pid:         12341234,
 		MachineName: "minikube",
 	}
-	err := reg.Register(runningTunnel1)
+
+	err := reg.Register(notRunningTunnel1)
 	if err != nil {
-		t.Errorf("expected no error got: %v", err)
-	}
-	err = reg.Register(runningTunnel2)
-	if err != nil {
-		t.Errorf("expected no error got: %v", err)
-	}
-	err = reg.Register(notRunningTunnel1)
-	if err != nil {
-		t.Errorf("expected no error got: %v", err)
+		return notRunningTunnel1, notRunningTunnel2, err
 	}
 	err = reg.Register(notRunningTunnel2)
+	if err != nil {
+		return notRunningTunnel1, notRunningTunnel2, err
+	}
+
+	return notRunningTunnel1, notRunningTunnel2, nil
+}
+func TestTunnelManagerCleanup(t *testing.T) {
+	reg, cleanup := createTestRegistry(t)
+	defer cleanup()
+
+	runningTunnel1, runningTunnel2, err := registerRunningTunnels(reg)
+	if err != nil {
+		t.Errorf("expected no error got: %v", err)
+	}
+
+	notRunningTunnel1, notRunningTunnel2, err := registerNotRunningTunnels(reg)
 	if err != nil {
 		t.Errorf("expected no error got: %v", err)
 	}

@@ -15,7 +15,7 @@
 # limitations under the License.
 
 
-# This script runs the integration tests on a Linux machine for the Virtualbox Driver
+# This script runs the integration tests on a Linux machine for the none Driver
 
 # The script expects the following env variables:
 # MINIKUBE_LOCATION: GIT_COMMIT from upstream build.
@@ -28,24 +28,44 @@ set -e
 
 OS_ARCH="linux-amd64"
 VM_DRIVER="none"
-JOB_NAME="Linux-None"
+JOB_NAME="none_Linux"
 EXTRA_ARGS="--bootstrapper=kubeadm"
+EXPECTED_DEFAULT_DRIVER="kvm2"
 
 SUDO_PREFIX="sudo -E "
 export KUBECONFIG="/root/.kube/config"
 
 # "none" driver specific cleanup from previous runs.
+sudo kubeadm reset -f || true
+# kubeadm reset may not stop pods immediately
+docker rm -f $(docker ps -aq) >/dev/null 2>&1 || true
 
-# Try without -f first, primarily because older kubeadm versions (v1.10) don't support it anyways.
-sudo kubeadm reset || sudo kubeadm reset -f || true
 # Cleanup data directory
 sudo rm -rf /data/*
 # Cleanup old Kubernetes configs
 sudo rm -rf /etc/kubernetes/*
-# Stop any leftover kubelets
-systemctl is-active --quiet kubelet \
-  && echo "stopping kubelet" \
-  && sudo systemctl stop kubelet
+sudo rm -rf /var/lib/minikube/* 
 
-# Download files and set permissions
+# Stop any leftover kubelet
+sudo systemctl is-active --quiet kubelet \
+  && echo "stopping kubelet" \
+  && sudo systemctl stop -f kubelet
+
+ # conntrack is required for kubernetes 1.18 and higher for none driver
+if ! conntrack --version &>/dev/null; then
+  echo "WARNING: contrack is not installed. will try to install."
+  sudo apt-get update -qq
+  sudo apt-get -qq -y install conntrack
+fi
+
+ # socat is required for kubectl port forward which is used in some tests such as validateHelmTillerAddon
+if ! which socat &>/dev/null; then
+  echo "WARNING: socat is not installed. will try to install."
+  sudo apt-get update -qq
+  sudo apt-get -qq -y install socat
+fi
+
+mkdir -p cron && gsutil -m rsync "gs://minikube-builds/${MINIKUBE_LOCATION}/cron" cron || echo "FAILED TO GET CRON FILES"
+sudo install cron/cleanup_and_reboot_Linux.sh /etc/cron.hourly/cleanup_and_reboot || echo "FAILED TO INSTALL CLEANUP"
+
 source ./common.sh

@@ -17,17 +17,20 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
 	"os"
 	"text/template"
 
 	"github.com/spf13/cobra"
 	cmdConfig "k8s.io/minikube/cmd/minikube/cmd/config"
-	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/reason"
 )
+
+const defaultCacheListFormat = "{{.CacheImage}}\n"
 
 var cacheListFormat string
 
+// CacheListTemplate represents the cache list template
 type CacheListTemplate struct {
 	CacheImage string
 }
@@ -38,38 +41,33 @@ var listCacheCmd = &cobra.Command{
 	Short: "List all available images from the local cache.",
 	Long:  "List all available images from the local cache.",
 	Run: func(cmd *cobra.Command, args []string) {
-		// list images from config file
-		images, err := cmdConfig.ListConfigMap(constants.Cache)
+		images, err := cmdConfig.ListConfigMap(cacheImageConfigKey)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error listing image entries from config: %v\n", err)
-			os.Exit(1)
+			exit.Error(reason.InternalListConfig, "Failed to get image map", err)
 		}
 		if err := cacheList(images); err != nil {
-			fmt.Fprintf(os.Stderr, "Error listing images: %v\n", err)
-			os.Exit(1)
+			exit.Error(reason.InternalCacheList, "Failed to list cached images", err)
 		}
 	},
 }
 
 func init() {
-	listCacheCmd.Flags().StringVar(&cacheListFormat, "format", constants.DefaultCacheListFormat,
+	listCacheCmd.Flags().StringVar(&cacheListFormat, "format", defaultCacheListFormat,
 		`Go template format string for the cache list output.  The format for Go templates can be found here: https://golang.org/pkg/text/template/
 For the list of accessible variables for the template, see the struct values here: https://godoc.org/k8s.io/minikube/cmd/minikube/cmd#CacheListTemplate`)
 	cacheCmd.AddCommand(listCacheCmd)
 }
 
+// cacheList returns a formatted list of images found within the local cache
 func cacheList(images []string) error {
 	for _, image := range images {
 		tmpl, err := template.New("list").Parse(cacheListFormat)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating list template: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 		listTmplt := CacheListTemplate{image}
-		err = tmpl.Execute(os.Stdout, listTmplt)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error executing list template: %v\n", err)
-			os.Exit(1)
+		if err := tmpl.Execute(os.Stdout, listTmplt); err != nil {
+			return err
 		}
 	}
 	return nil

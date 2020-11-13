@@ -1,3 +1,5 @@
+// +build linux
+
 /*
 Copyright 2018 The Kubernetes Authors All rights reserved.
 
@@ -31,7 +33,7 @@ import (
 var sysFsPCIDevicesPath = "/sys/bus/pci/devices/"
 var sysKernelIOMMUGroupsPath = "/sys/kernel/iommu_groups/"
 
-const nvidiaVendorId = "0x10de"
+const nvidiaVendorID = "0x10de"
 
 const devicesTmpl = `
 <graphics type='spice' autoport='yes'>
@@ -50,6 +52,7 @@ const devicesTmpl = `
 {{end}}
 `
 
+// PCIDevice holds a parsed PCI device
 type PCIDevice struct {
 	Domain   string
 	Bus      string
@@ -68,12 +71,12 @@ func getDevicesXML() (string, error) {
 	for _, device := range unboundNVIDIADevices {
 		splits := strings.Split(device, ":")
 		if len(splits) != 3 {
-			log.Infof("Error while parsing PCI device %q. Not splitable into domain:bus:slot.function.", device)
+			log.Infof("Error while parsing PCI device %q. Not splittable into domain:bus:slot.function.", device)
 			continue
 		}
 		parts := strings.Split(splits[2], ".")
 		if len(parts) != 2 {
-			log.Infof("Error while parsing PCI device %q. Not splitable into domain:bus:slot.function.", device)
+			log.Infof("Error while parsing PCI device %q. Not splittable into domain:bus:slot.function.", device)
 			continue
 		}
 		pciDevice := PCIDevice{
@@ -107,7 +110,7 @@ func getPassthroughableNVIDIADevices() ([]string, error) {
 		return []string{}, fmt.Errorf("error reading %q: %v", sysKernelIOMMUGroupsPath, err)
 	}
 	if len(iommuGroups) == 0 {
-		return []string{}, fmt.Errorf("no IOMMU groups found at %q. Make sure your host supports IOMMU. See instructions at https://github.com/kubernetes/minikube/blob/master/docs/gpu.md", sysKernelIOMMUGroupsPath)
+		return []string{}, fmt.Errorf("no IOMMU groups found at %q. Make sure your host supports IOMMU. See instructions at https://minikube.sigs.k8s.io/docs/tutorials/nvidia_gpu/", sysKernelIOMMUGroupsPath)
 	}
 
 	// Get list of PCI devices
@@ -127,8 +130,8 @@ func getPassthroughableNVIDIADevices() ([]string, error) {
 		}
 
 		// Check if this is an NVIDIA device
-		if strings.EqualFold(strings.TrimSpace(string(content)), nvidiaVendorId) {
-			log.Infof("Found device %v with NVIDIA's vendorId %v", device.Name(), nvidiaVendorId)
+		if strings.EqualFold(strings.TrimSpace(string(content)), nvidiaVendorID) {
+			log.Infof("Found device %v with NVIDIA's vendorId %v", device.Name(), nvidiaVendorID)
 			found = true
 
 			// Check whether it's unbound. We don't want the device to be bound to nvidia/nouveau etc.
@@ -143,7 +146,7 @@ func getPassthroughableNVIDIADevices() ([]string, error) {
 		return []string{}, fmt.Errorf("no NVIDIA devices found")
 	}
 	if len(unboundNVIDIADevices) == 0 {
-		return []string{}, fmt.Errorf("some NVIDIA devices were found but none of them were unbound. See instructions at https://github.com/kubernetes/minikube/blob/master/docs/gpu.md")
+		return []string{}, fmt.Errorf("some NVIDIA devices were found but none of them were unbound. See instructions at https://minikube.sigs.k8s.io/docs/tutorials/nvidia_gpu/")
 	}
 
 	// Make sure all the unbound devices are in IOMMU groups that only contain unbound devices.
@@ -158,7 +161,7 @@ func getPassthroughableNVIDIADevices() ([]string, error) {
 		}
 	}
 	if len(isolatedNVIDIADevices) == 0 {
-		return []string{}, fmt.Errorf("some unbound NVIDIA devices were found but they had other devices in their IOMMU group that were bound. See instructoins at https://github.com/kubernetes/minikube/blob/master/docs/gpu.md")
+		return []string{}, fmt.Errorf("some unbound NVIDIA devices were found but they had other devices in their IOMMU group that were bound. See instructions at https://minikube.sigs.k8s.io/docs/tutorials/nvidia_gpu/")
 	}
 
 	return isolatedNVIDIADevices, nil
@@ -171,7 +174,7 @@ func isIsolated(device string) bool {
 	iommuGroupPath := filepath.Join(sysFsPCIDevicesPath, device, "iommu_group", "devices")
 	otherDevices, err := ioutil.ReadDir(iommuGroupPath)
 	if err != nil {
-		log.Infof("Error reading %q: %v", iommuGroupPath)
+		log.Infof("Error reading %q: %v", iommuGroupPath, err)
 		return false
 	}
 
@@ -195,14 +198,12 @@ func isUnbound(device string) bool {
 	if os.IsNotExist(err) {
 		log.Infof("%v is not bound to any driver", device)
 		return true
-	} else {
-		module := filepath.Base(modulePath)
-		if module == "pci_stub" || module == "vfio_pci" {
-			log.Infof("%v is bound to a stub module: %v", device, module)
-			return true
-		} else {
-			log.Infof("%v is bound to a non-stub module: %v", device, module)
-			return false
-		}
 	}
+	module := filepath.Base(modulePath)
+	if module == "pci_stub" || module == "vfio_pci" {
+		log.Infof("%v is bound to a stub module: %v", device, module)
+		return true
+	}
+	log.Infof("%v is bound to a non-stub module: %v", device, module)
+	return false
 }

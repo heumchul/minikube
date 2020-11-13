@@ -19,7 +19,6 @@ package notify
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net/http"
 	"runtime"
@@ -27,49 +26,52 @@ import (
 	"time"
 
 	"github.com/blang/semver"
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/config"
-	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/minikube/localpath"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/style"
+	"k8s.io/minikube/pkg/util/lock"
 	"k8s.io/minikube/pkg/version"
 )
 
-const updateLinkPrefix = "https://github.com/kubernetes/minikube/releases/tag/v"
-
 var (
 	timeLayout              = time.RFC1123
-	lastUpdateCheckFilePath = constants.MakeMiniPath("last_update_check")
+	lastUpdateCheckFilePath = localpath.MakeMiniPath("last_update_check")
 )
 
-func MaybePrintUpdateTextFromGithub(output io.Writer) {
-	MaybePrintUpdateText(output, constants.GithubMinikubeReleasesURL, lastUpdateCheckFilePath)
+// MaybePrintUpdateTextFromGithub prints update text if needed, from github
+func MaybePrintUpdateTextFromGithub() bool {
+	return MaybePrintUpdateText(GithubMinikubeReleasesURL, lastUpdateCheckFilePath)
 }
 
-func MaybePrintUpdateText(output io.Writer, url string, lastUpdatePath string) {
+// MaybePrintUpdateText prints update text, returns a bool if life is good.
+func MaybePrintUpdateText(url string, lastUpdatePath string) bool {
 	if !shouldCheckURLVersion(lastUpdatePath) {
-		return
+		return false
 	}
 	latestVersion, err := getLatestVersionFromURL(url)
 	if err != nil {
-		glog.Warning(err)
-		return
+		klog.Warning(err)
+		return true
 	}
 	localVersion, err := version.GetSemverVersion()
 	if err != nil {
-		glog.Warning(err)
-		return
+		klog.Warning(err)
+		return true
 	}
 	if localVersion.Compare(latestVersion) < 0 {
-		writeTimeToFile(lastUpdateCheckFilePath, time.Now().UTC())
-		fmt.Fprintf(output, `There is a newer version of minikube available (%s%s).  Download it here:
-%s%s
-
-To disable this notification, run the following:
-minikube config set WantUpdateNotification false
-`,
-			version.VersionPrefix, latestVersion, updateLinkPrefix, latestVersion)
+		if err := writeTimeToFile(lastUpdateCheckFilePath, time.Now().UTC()); err != nil {
+			klog.Errorf("write time failed: %v", err)
+		}
+		url := "https://github.com/kubernetes/minikube/releases/tag/v" + latestVersion.String()
+		out.T(style.Celebrate, `minikube {{.version}} is available! Download it: {{.url}}`, out.V{"version": latestVersion, "url": url})
+		out.T(style.Tip, "To disable this notice, run: 'minikube config set WantUpdateNotification false'\n")
+		return true
 	}
+	return false
 }
 
 func shouldCheckURLVersion(filePath string) bool {
@@ -80,14 +82,16 @@ func shouldCheckURLVersion(filePath string) bool {
 	return time.Since(lastUpdateTime).Hours() >= viper.GetFloat64(config.ReminderWaitPeriodInHours)
 }
 
+// Release represents a release
 type Release struct {
 	Name      string
 	Checksums map[string]string
 }
 
+// Releases represents several release
 type Releases []Release
 
-func getJson(url string, target *Releases) error {
+func getJSON(url string, target *Releases) error {
 	client := &http.Client{}
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -116,10 +120,11 @@ func getLatestVersionFromURL(url string) (semver.Version, error) {
 	return semver.Make(strings.TrimPrefix(r[0].Name, version.VersionPrefix))
 }
 
+// GetAllVersionsFromURL get all versions from a JSON URL
 func GetAllVersionsFromURL(url string) (Releases, error) {
 	var releases Releases
-	glog.Info("Checking for updates...")
-	if err := getJson(url, &releases); err != nil {
+	klog.Info("Checking for updates...")
+	if err := getJSON(url, &releases); err != nil {
 		return releases, errors.Wrap(err, "Error getting json from minikube version url")
 	}
 	if len(releases) == 0 {
@@ -129,7 +134,7 @@ func GetAllVersionsFromURL(url string) (Releases, error) {
 }
 
 func writeTimeToFile(path string, inputTime time.Time) error {
-	err := ioutil.WriteFile(path, []byte(inputTime.Format(timeLayout)), 0644)
+	err := lock.WriteFile(path, []byte(inputTime.Format(timeLayout)), 0o644)
 	if err != nil {
 		return errors.Wrap(err, "Error writing current update time to file: ")
 	}

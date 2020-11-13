@@ -17,16 +17,18 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
 	"os"
+	"runtime"
 	"strings"
 
-	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
-	"k8s.io/api/core/v1"
-
-	"k8s.io/minikube/pkg/minikube/machine"
+	core "k8s.io/api/core/v1"
+	"k8s.io/minikube/pkg/drivers/kic/oci"
+	"k8s.io/minikube/pkg/minikube/mustload"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 	"k8s.io/minikube/pkg/minikube/service"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 var serviceListNamespace string
@@ -37,17 +39,13 @@ var serviceListCmd = &cobra.Command{
 	Short: "Lists the URLs for the services in your local cluster",
 	Long:  `Lists the URLs for the services in your local cluster`,
 	Run: func(cmd *cobra.Command, args []string) {
-		api, err := machine.NewAPIClient()
+		co := mustload.Healthy(ClusterFlagValue())
+
+		serviceURLs, err := service.GetServiceURLs(co.API, co.Config.Name, serviceListNamespace, serviceURLTemplate)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting client: %v\n", err)
-			os.Exit(1)
-		}
-		defer api.Close()
-		serviceURLs, err := service.GetServiceURLs(api, serviceListNamespace, serviceURLTemplate)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			fmt.Fprintln(os.Stderr, "Check that minikube is running and that you have specified the correct namespace (-n flag) if required.")
-			os.Exit(1)
+			out.FatalT("Failed to get service URL: {{.error}}", out.V{"error": err})
+			out.ErrT(style.Notice, "Check that minikube is running and that you have specified the correct namespace (-n flag) if required.")
+			os.Exit(reason.ExSvcUnavailable)
 		}
 
 		var data [][]string
@@ -55,21 +53,23 @@ var serviceListCmd = &cobra.Command{
 			if len(serviceURL.URLs) == 0 {
 				data = append(data, []string{serviceURL.Namespace, serviceURL.Name, "No node port"})
 			} else {
-				data = append(data, []string{serviceURL.Namespace, serviceURL.Name, strings.Join(serviceURL.URLs, "\n")})
-			}
+				servicePortNames := strings.Join(serviceURL.PortNames, "\n")
+				serviceURLs := strings.Join(serviceURL.URLs, "\n")
 
+				// if we are running Docker on OSX we empty the internal service URLs
+				if runtime.GOOS == "darwin" && co.Config.Driver == oci.Docker {
+					serviceURLs = ""
+				}
+
+				data = append(data, []string{serviceURL.Namespace, serviceURL.Name, servicePortNames, serviceURLs})
+			}
 		}
 
-		table := tablewriter.NewWriter(os.Stdout)
-		table.SetHeader([]string{"Namespace", "Name", "URL"})
-		table.SetBorders(tablewriter.Border{Left: true, Top: true, Right: true, Bottom: true})
-		table.SetCenterSeparator("|")
-		table.AppendBulk(data) // Add Bulk Data
-		table.Render()
+		service.PrintServiceList(os.Stdout, data)
 	},
 }
 
 func init() {
-	serviceListCmd.Flags().StringVarP(&serviceListNamespace, "namespace", "n", v1.NamespaceAll, "The services namespace")
+	serviceListCmd.Flags().StringVarP(&serviceListNamespace, "namespace", "n", core.NamespaceAll, "The services namespace")
 	serviceCmd.AddCommand(serviceListCmd)
 }

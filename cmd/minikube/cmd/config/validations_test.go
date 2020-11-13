@@ -51,7 +51,7 @@ func TestDriver(t *testing.T) {
 		},
 	}
 
-	runValidations(t, tests, "vm-driver", IsValidDriver)
+	runValidations(t, tests, "driver", IsValidDriver)
 
 }
 
@@ -96,6 +96,33 @@ func TestValidCIDR(t *testing.T) {
 	}
 
 	runValidations(t, tests, "cidr", IsValidCIDR)
+}
+
+func TestValidRuntime(t *testing.T) {
+	var tests = []validationTest{
+		{
+			value:     "", // default
+			shouldErr: false,
+		},
+		{
+			value:     "invalid",
+			shouldErr: true,
+		},
+		{
+			value:     "containerd",
+			shouldErr: false,
+		},
+		{
+			value:     "crio",
+			shouldErr: false,
+		},
+		{
+			value:     "docker",
+			shouldErr: false,
+		},
+	}
+
+	runValidations(t, tests, "container-runtime", IsValidRuntime)
 }
 
 func TestIsURLExists(t *testing.T) {

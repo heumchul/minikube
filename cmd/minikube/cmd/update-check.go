@@ -17,13 +17,11 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
-	"os"
-
 	"github.com/spf13/cobra"
-
-	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/notify"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 	"k8s.io/minikube/pkg/version"
 )
 
@@ -31,28 +29,18 @@ var updateCheckCmd = &cobra.Command{
 	Use:   "update-check",
 	Short: "Print current and latest version number",
 	Long:  `Print current and latest version number`,
-	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		// Explicitly disable update checking for the version command
-		enableUpdateNotification = false
-	},
 	Run: func(command *cobra.Command, args []string) {
-		url := constants.GithubMinikubeReleasesURL
+		url := notify.GithubMinikubeReleasesURL
 		r, err := notify.GetAllVersionsFromURL(url)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error fetching latest version from internet")
-			os.Exit(1)
+			exit.Error(reason.InetVersionUnavailable, "Unable to fetch latest version info", err)
 		}
 
 		if len(r) < 1 {
-			fmt.Fprintf(os.Stderr, "Got empty version list from server")
-			os.Exit(2)
+			exit.Message(reason.InetVersionEmpty, "Update server returned an empty list")
 		}
 
-		fmt.Println("CurrentVersion:", version.GetVersion())
-		fmt.Println("LatestVersion:", r[0].Name)
+		out.Ln("CurrentVersion: %s", version.GetVersion())
+		out.Ln("LatestVersion: %s", r[0].Name)
 	},
-}
-
-func init() {
-	RootCmd.AddCommand(updateCheckCmd)
 }

@@ -19,6 +19,8 @@ package tunnel
 import (
 	"testing"
 
+	"k8s.io/minikube/pkg/util"
+
 	"net"
 	"reflect"
 	"strings"
@@ -32,16 +34,20 @@ import (
 func TestAPIError(t *testing.T) {
 	machineName := "nonexistentmachine"
 
-	machineAPI := tests.NewMockAPI()
+	machineAPI := tests.NewMockAPI(t)
 	configLoader := &stubConfigLoader{}
 	inspector := &clusterInspector{
 		machineAPI, configLoader, machineName,
 	}
 
-	s, r, err := inspector.getStateAndRoute()
+	_, _, err := inspector.getStateAndRoute()
+	if err == nil {
+		t.Errorf("expected error, got nil")
+	}
 
-	if err == nil || !strings.Contains(err.Error(), "Machine does not exist") {
-		t.Errorf("cluster inspector should propagate errors from API, getStateAndRoute() returned \"%v, %v\", %v", s, r, err)
+	// Make sure we properly propagate errors upward
+	if !strings.Contains(err.Error(), "exist") {
+		t.Errorf("getStateAndRoute error=%q, expected *exist*", err)
 	}
 }
 
@@ -60,7 +66,7 @@ func TestMinikubeCheckReturnsHostInformation(t *testing.T) {
 	}
 
 	configLoader := &stubConfigLoader{
-		c: &config.Config{
+		c: &config.ClusterConfig{
 			KubernetesConfig: config.KubernetesConfig{
 				ServiceCIDR: "96.0.0.0/12",
 			},
@@ -78,10 +84,15 @@ func TestMinikubeCheckReturnsHostInformation(t *testing.T) {
 
 	ip := net.ParseIP("1.2.3.4")
 	_, ipNet, _ := net.ParseCIDR("96.0.0.0/12")
+	dnsIP, err := util.GetDNSIP(ipNet.String())
+	if err != nil {
+		t.Errorf("getdnsIP: %v", err)
+	}
 
 	expectedRoute := &Route{
-		Gateway:  ip,
-		DestCIDR: ipNet,
+		Gateway:      ip,
+		DestCIDR:     ipNet,
+		ClusterDNSIP: dnsIP,
 	}
 
 	if s != Running {
@@ -93,7 +104,7 @@ func TestMinikubeCheckReturnsHostInformation(t *testing.T) {
 }
 
 func TestUnparseableCIDR(t *testing.T) {
-	cfg := config.Config{
+	cfg := config.ClusterConfig{
 		KubernetesConfig: config.KubernetesConfig{
 			ServiceCIDR: "bad.cidr.0.0/12",
 		}}
@@ -113,7 +124,7 @@ func TestUnparseableCIDR(t *testing.T) {
 func TestRouteIPDetection(t *testing.T) {
 	expectedTargetCIDR := "10.96.0.0/12"
 
-	cfg := config.Config{
+	cfg := config.ClusterConfig{
 		KubernetesConfig: config.KubernetesConfig{
 			ServiceCIDR: expectedTargetCIDR,
 		},

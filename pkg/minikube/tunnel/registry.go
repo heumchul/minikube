@@ -22,20 +22,24 @@ import (
 	"io/ioutil"
 	"os"
 
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
+
+	"k8s.io/klog/v2"
 )
 
 // There is one tunnel registry per user, shared across multiple vms.
 // It can register, list and check for existing and running tunnels
+
+// ID represents a registry ID
 type ID struct {
-	//Route is the key
+	// Route is the key
 	Route *Route
-	//the rest is metadata
+	// the rest is metadata
 	MachineName string
 	Pid         int
 }
 
+// Equal checks if two ID are equal
 func (t *ID) Equal(other *ID) bool {
 	return t.Route.Equal(other.Route) &&
 		t.MachineName == other.MachineName &&
@@ -70,8 +74,8 @@ func (r *persistentRegistry) IsAlreadyDefinedAndRunning(tunnel *ID) (*ID, error)
 	return nil, nil
 }
 
-func (r *persistentRegistry) Register(tunnel *ID) error {
-	glog.V(3).Infof("registering tunnel: %s", tunnel)
+func (r *persistentRegistry) Register(tunnel *ID) (rerr error) {
+	klog.V(3).Infof("registering tunnel: %s", tunnel)
 	if tunnel.Route == nil {
 		return errors.New("tunnel.Route should not be nil")
 	}
@@ -105,7 +109,7 @@ func (r *persistentRegistry) Register(tunnel *ID) error {
 		return fmt.Errorf("error marshalling json %s", err)
 	}
 
-	glog.V(5).Infof("json marshalled: %v, %s\n", tunnels, bytes)
+	klog.V(5).Infof("json marshalled: %v, %s\n", tunnels, bytes)
 
 	f, err := os.OpenFile(r.path, os.O_RDWR|os.O_TRUNC, 0600)
 	if err != nil {
@@ -121,7 +125,7 @@ func (r *persistentRegistry) Register(tunnel *ID) error {
 	defer func() {
 		err := f.Close()
 		if err != nil {
-			fmt.Errorf("error closing registry file: %s", err)
+			rerr = fmt.Errorf("error closing registry file: %s", err)
 		}
 	}()
 
@@ -133,8 +137,8 @@ func (r *persistentRegistry) Register(tunnel *ID) error {
 	return nil
 }
 
-func (r *persistentRegistry) Remove(route *Route) error {
-	glog.V(3).Infof("removing tunnel from registry: %s", route)
+func (r *persistentRegistry) Remove(route *Route) (rerr error) {
+	klog.V(3).Infof("removing tunnel from registry: %s", route)
 	tunnels, err := r.List()
 	if err != nil {
 		return err
@@ -150,7 +154,7 @@ func (r *persistentRegistry) Remove(route *Route) error {
 		return fmt.Errorf("can't remove route: %s not found in tunnel registry", route)
 	}
 	tunnels = append(tunnels[:idx], tunnels[idx+1:]...)
-	glog.V(4).Infof("tunnels after remove: %s", tunnels)
+	klog.V(4).Infof("tunnels after remove: %s", tunnels)
 	f, err := os.OpenFile(r.path, os.O_RDWR|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("error removing tunnel %s", err)
@@ -158,7 +162,7 @@ func (r *persistentRegistry) Remove(route *Route) error {
 	defer func() {
 		err := f.Close()
 		if err != nil {
-			fmt.Errorf("error closing tunnel registry file: %s", err)
+			rerr = fmt.Errorf("error closing tunnel registry file: %s", err)
 		}
 	}()
 

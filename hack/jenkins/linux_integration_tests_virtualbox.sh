@@ -15,7 +15,7 @@
 # limitations under the License.
 
 
-# This script runs the integration tests on a Linux machine for the Virtualbox Driver
+# This script runs the integration tests on a Linux machine for the VirtualBox Driver
 
 # The script expects the following env variables:
 # MINIKUBE_LOCATION: GIT_COMMIT from upstream build.
@@ -27,7 +27,10 @@ set -e
 
 OS_ARCH="linux-amd64"
 VM_DRIVER="virtualbox"
-JOB_NAME="Linux-VirtualBox"
+JOB_NAME="VirtualBox_Linux"
+EXPECTED_DEFAULT_DRIVER="kvm2"
 
-# Download files and set permissions
+mkdir -p cron && gsutil -qm rsync "gs://minikube-builds/${MINIKUBE_LOCATION}/cron" cron || echo "FAILED TO GET CRON FILES"
+sudo install cron/cleanup_and_reboot_Linux.sh /etc/cron.hourly/cleanup_and_reboot || echo "FAILED TO INSTALL CLEANUP"
+
 source ./common.sh

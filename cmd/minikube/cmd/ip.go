@@ -17,13 +17,9 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
-	"os"
-
-	"github.com/golang/glog"
 	"github.com/spf13/cobra"
-	"k8s.io/minikube/pkg/minikube/config"
-	"k8s.io/minikube/pkg/minikube/machine"
+	"k8s.io/minikube/pkg/minikube/mustload"
+	"k8s.io/minikube/pkg/minikube/out"
 )
 
 // ipCmd represents the ip command
@@ -32,26 +28,7 @@ var ipCmd = &cobra.Command{
 	Short: "Retrieves the IP address of the running cluster",
 	Long:  `Retrieves the IP address of the running cluster, and writes it to STDOUT.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		api, err := machine.NewAPIClient()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting client: %v\n", err)
-			os.Exit(1)
-		}
-		defer api.Close()
-		host, err := api.Load(config.GetMachineName())
-		if err != nil {
-			glog.Errorln("Error getting IP: ", err)
-			os.Exit(1)
-		}
-		ip, err := host.Driver.GetIP()
-		if err != nil {
-			glog.Errorln("Error getting IP: ", err)
-			os.Exit(1)
-		}
-		fmt.Println(ip)
+		co := mustload.Running(ClusterFlagValue())
+		out.Ln(co.CP.IP.String())
 	},
-}
-
-func init() {
-	RootCmd.AddCommand(ipCmd)
 }

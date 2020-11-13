@@ -21,20 +21,22 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/storage"
 )
+
+var pvDir = "/tmp/hostpath-provisioner"
 
 func main() {
 	// Glog requires that /tmp exists.
 	if err := os.MkdirAll("/tmp", 0755); err != nil {
-		fmt.Printf("Error creating tmpdir: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error creating tmpdir: %v\n", err)
 		os.Exit(1)
 	}
 	flag.Parse()
 
-	if err := storage.StartStorageProvisioner(); err != nil {
-		glog.Exit(err)
+	if err := storage.StartStorageProvisioner(pvDir); err != nil {
+		klog.Exit(err)
 	}
 
 }

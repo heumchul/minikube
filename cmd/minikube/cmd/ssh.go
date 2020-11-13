@@ -17,46 +17,56 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
 	"os"
 
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"k8s.io/minikube/pkg/minikube/cluster"
+
 	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/machine"
+	"k8s.io/minikube/pkg/minikube/mustload"
+	"k8s.io/minikube/pkg/minikube/node"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 )
+
+var nativeSSHClient bool
 
 // sshCmd represents the docker-ssh command
 var sshCmd = &cobra.Command{
 	Use:   "ssh",
-	Short: "Log into or run a command on a machine with SSH; similar to 'docker-machine ssh'",
+	Short: "Log into the minikube environment (for debugging)",
 	Long:  "Log into or run a command on a machine with SSH; similar to 'docker-machine ssh'.",
 	Run: func(cmd *cobra.Command, args []string) {
-		api, err := machine.NewAPIClient()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting client: %v\n", err)
-			os.Exit(1)
+		cname := ClusterFlagValue()
+		co := mustload.Running(cname)
+		if co.CP.Host.DriverName == driver.None {
+			exit.Message(reason.Usage, "'none' driver does not support 'minikube ssh' command")
 		}
-		defer api.Close()
-		host, err := cluster.CheckIfHostExistsAndLoad(api, config.GetMachineName())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting host: %v\n", err)
-			os.Exit(1)
+
+		var err error
+		var n *config.Node
+		if nodeName == "" {
+			n = co.CP.Node
+		} else {
+			n, _, err = node.Retrieve(*co.Config, nodeName)
+			if err != nil {
+				exit.Message(reason.GuestNodeRetrieve, "Node {{.nodeName}} does not exist.", out.V{"nodeName": nodeName})
+			}
 		}
-		if host.Driver.DriverName() == "none" {
-			fmt.Println(`'none' driver does not support 'minikube ssh' command`)
-			os.Exit(0)
-		}
-		err = cluster.CreateSSHShell(api, args)
+
+		err = machine.CreateSSHShell(co.API, *co.Config, *n, args, nativeSSHClient)
 		if err != nil {
-			glog.Errorln(errors.Wrap(err, "Error attempting to ssh/run-ssh-command"))
+			// This is typically due to a non-zero exit code, so no need for flourish.
+			out.ErrLn("ssh: %v", err)
+			// It'd be nice if we could pass up the correct error code here :(
 			os.Exit(1)
 		}
 	},
 }
 
 func init() {
-	RootCmd.AddCommand(sshCmd)
+	sshCmd.Flags().BoolVar(&nativeSSHClient, "native-ssh", true, "Use native Golang SSH client (default true). Set to 'false' to use the command line 'ssh' command when accessing the docker machine. Useful for the machine drivers when they will not start with 'Waiting for SSH'.")
+	sshCmd.Flags().StringVarP(&nodeName, "node", "n", "", "The node to ssh into. Defaults to the primary control plane.")
 }

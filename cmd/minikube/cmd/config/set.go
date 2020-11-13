@@ -17,12 +17,13 @@ limitations under the License.
 package config
 
 import (
-	"fmt"
-	"os"
-
-	pkgConfig "k8s.io/minikube/pkg/minikube/config"
-
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/localpath"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 )
 
 var configSetCmd = &cobra.Command{
@@ -31,14 +32,15 @@ var configSetCmd = &cobra.Command{
 	Long: `Sets the PROPERTY_NAME config value to PROPERTY_VALUE
 	These values can be overwritten by flags or environment variables at runtime.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) != 2 {
-			fmt.Fprintln(os.Stderr, "usage: minikube config set PROPERTY_NAME PROPERTY_VALUE")
-			os.Exit(1)
+		if len(args) < 2 {
+			exit.Message(reason.Usage, "not enough arguments ({{.ArgCount}}).\nusage: minikube config set PROPERTY_NAME PROPERTY_VALUE", out.V{"ArgCount": len(args)})
+		}
+		if len(args) > 2 {
+			exit.Message(reason.Usage, "toom any arguments ({{.ArgCount}}).\nusage: minikube config set PROPERTY_NAME PROPERTY_VALUE", out.V{"ArgCount": len(args)})
 		}
 		err := Set(args[0], args[1])
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			exit.Error(reason.InternalConfigSet, "Set failed", err)
 		}
 	},
 }
@@ -47,33 +49,34 @@ func init() {
 	ConfigCmd.AddCommand(configSetCmd)
 }
 
+// Set sets a property to a value
 func Set(name string, value string) error {
 	s, err := findSetting(name)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "find settings for %q value of %q", name, value)
 	}
 	// Validate the new value
 	err = run(name, value, s.validations)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "run validations for %q with value of %q", name, value)
 	}
 
 	// Set the value
-	config, err := pkgConfig.ReadConfig()
+	cc, err := config.ReadConfig(localpath.ConfigFile())
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "read config file %q", localpath.ConfigFile())
 	}
-	err = s.set(config, name, value)
+	err = s.set(cc, name, value)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "set")
 	}
 
 	// Run any callbacks for this property
 	err = run(name, value, s.callbacks)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "run callbacks for %q with value of %q", name, value)
 	}
 
 	// Write the value
-	return WriteConfig(config)
+	return config.WriteConfig(localpath.ConfigFile(), cc)
 }

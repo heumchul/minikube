@@ -1,4 +1,4 @@
-// +build darwin
+// +build darwin, !gendocs
 
 /*
 Copyright 2016 The Kubernetes Authors All rights reserved.
@@ -18,4 +18,5 @@ limitations under the License.
 
 package constants
 
+// DefaultMountDir is the default mounting directory for Darwin
 var DefaultMountDir = "/Users"

@@ -31,12 +31,12 @@ oom_score = 0
     enable_selinux = false
     sandbox_image = "k8s.gcr.io/pause:3.1"
     stats_collect_period = 10
-    systemd_cgroup = false
+    systemd_cgroup = true
     enable_tls_streaming = false
     max_container_log_line_size = 16384
     [plugins.cri.containerd]
       snapshotter = "overlayfs"
-      no_pivot = true
+      no_pivot = false
       [plugins.cri.containerd.default_runtime]
         runtime_type = "io.containerd.runtime.v1.linux"
         runtime_engine = ""

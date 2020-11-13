@@ -19,16 +19,15 @@ package machine
 import (
 	"bufio"
 	"fmt"
-	"io/ioutil"
-	"log"
 	"net"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/docker/machine/libmachine/drivers/plugin/localbinary"
-	"k8s.io/minikube/pkg/minikube/constants"
-	_ "k8s.io/minikube/pkg/minikube/drivers/virtualbox"
+
+	"k8s.io/minikube/pkg/minikube/driver"
+	_ "k8s.io/minikube/pkg/minikube/registry/drvs/virtualbox"
+	testutil "k8s.io/minikube/pkg/minikube/tests"
 )
 
 const vboxConfig = `
@@ -76,12 +75,12 @@ func TestLocalClientNewHost(t *testing.T) {
 	}{
 		{
 			description: "host vbox correct",
-			driver:      "virtualbox",
+			driver:      driver.VirtualBox,
 			rawDriver:   []byte(vboxConfig),
 		},
 		{
 			description: "host vbox incorrect",
-			driver:      "virtualbox",
+			driver:      driver.VirtualBox,
 			rawDriver:   []byte("?"),
 			err:         true,
 		},
@@ -111,19 +110,9 @@ func TestLocalClientNewHost(t *testing.T) {
 	}
 }
 
-func makeTempDir() string {
-	tempDir, err := ioutil.TempDir("", "minipath")
-	if err != nil {
-		log.Fatal(err)
-	}
-	tempDir = filepath.Join(tempDir, ".minikube")
-	os.Setenv(constants.MinikubeHome, tempDir)
-	return constants.GetMinipath()
-}
-
 func TestRunNotDriver(t *testing.T) {
-	tempDir := makeTempDir()
-	defer os.RemoveAll(tempDir)
+	tempDir := testutil.MakeTempDir()
+	defer testutil.RemoveTempDir(tempDir)
 	StartDriver()
 	if !localbinary.CurrentBinaryIsDockerMachine {
 		t.Fatal("CurrentBinaryIsDockerMachine not set. This will break driver initialization.")
@@ -133,11 +122,11 @@ func TestRunNotDriver(t *testing.T) {
 func TestRunDriver(t *testing.T) {
 	// This test is a bit complicated. It verifies that when the root command is
 	// called with the proper environment variables, we setup the libmachine driver.
-	tempDir := makeTempDir()
-	defer os.RemoveAll(tempDir)
+	tempDir := testutil.MakeTempDir()
+	defer testutil.RemoveTempDir(tempDir)
 
 	os.Setenv(localbinary.PluginEnvKey, localbinary.PluginEnvVal)
-	os.Setenv(localbinary.PluginEnvDriverName, "virtualbox")
+	os.Setenv(localbinary.PluginEnvDriverName, driver.VirtualBox)
 
 	// Capture stdout and reset it later.
 	old := os.Stdout

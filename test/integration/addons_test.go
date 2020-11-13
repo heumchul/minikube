@@ -19,246 +19,575 @@ limitations under the License.
 package integration
 
 import (
-	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/docker/machine/libmachine/state"
-	"k8s.io/apimachinery/pkg/labels"
-	pkgutil "k8s.io/minikube/pkg/util"
-	"k8s.io/minikube/test/integration/util"
+	"github.com/hashicorp/go-retryablehttp"
+	"k8s.io/minikube/pkg/kapi"
+	"k8s.io/minikube/pkg/util/retry"
 )
 
-func testAddons(t *testing.T) {
-	t.Parallel()
-	client, err := pkgutil.GetClient()
-	if err != nil {
-		t.Fatalf("Could not get kubernetes client: %v", err)
-	}
-	selector := labels.SelectorFromSet(labels.Set(map[string]string{"component": "kube-addon-manager"}))
-	if err := pkgutil.WaitForPodsWithLabelRunning(client, "kube-system", selector); err != nil {
-		t.Errorf("Error waiting for addon manager to be up")
-	}
-}
+// TestAddons tests addons that require no special environment -- in parallel
+func TestAddons(t *testing.T) {
+	profile := UniqueProfileName("addons")
+	ctx, cancel := context.WithTimeout(context.Background(), Minutes(40))
+	defer Cleanup(t, profile, cancel)
 
-func readLineWithTimeout(b *bufio.Reader, timeout time.Duration) (string, error) {
-	s := make(chan string)
-	e := make(chan error)
-	go func() {
-		read, err := b.ReadString('\n')
-		if err != nil {
-			e <- err
-		} else {
-			s <- read
+	// Set an env var to point to our dummy credentials file
+	err := os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(*testdataDir, "gcp-creds.json"))
+	defer os.Unsetenv("GOOGLE_APPLICATION_CREDENTIALS")
+	if err != nil {
+		t.Fatalf("Failed setting GOOGLE_APPLICATION_CREDENTIALS env var: %v", err)
+	}
+
+	err = os.Setenv("GOOGLE_CLOUD_PROJECT", "this_is_fake")
+	defer os.Unsetenv("GOOGLE_CLOUD_PROJECT")
+	if err != nil {
+		t.Fatalf("Failed setting GOOGLE_CLOUD_PROJECT env var: %v", err)
+	}
+
+	args := append([]string{"start", "-p", profile, "--wait=true", "--memory=4000", "--alsologtostderr", "--addons=registry", "--addons=metrics-server", "--addons=helm-tiller", "--addons=olm", "--addons=volumesnapshots", "--addons=csi-hostpath-driver", "--addons=gcp-auth"}, StartArgs()...)
+	if !NoneDriver() && !(runtime.GOOS == "darwin" && KicDriver()) { // none doesn't support ingress
+		args = append(args, "--addons=ingress")
+	}
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), args...))
+	if err != nil {
+		t.Fatalf("%s failed: %v", rr.Command(), err)
+	}
+
+	// Parallelized tests
+	t.Run("parallel", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			validator validateFunc
+		}{
+			{"Registry", validateRegistryAddon},
+			{"Ingress", validateIngressAddon},
+			{"MetricsServer", validateMetricsServerAddon},
+			{"HelmTiller", validateHelmTillerAddon},
+			{"Olm", validateOlmAddon},
+			{"CSI", validateCSIDriverAndSnapshots},
+			{"GCPAuth", validateGCPAuthAddon},
 		}
-		close(s)
-		close(e)
-	}()
-
-	select {
-	case line := <-s:
-		return line, nil
-	case err := <-e:
-		return "", err
-	case <-time.After(timeout):
-		return "", fmt.Errorf("timeout after %s", timeout)
-	}
-}
-
-func testDashboard(t *testing.T) {
-	t.Parallel()
-	minikubeRunner := NewMinikubeRunner(t)
-	cmd, out := minikubeRunner.RunDaemon("dashboard --url")
-	defer func() {
-		err := cmd.Process.Kill()
-		if err != nil {
-			t.Logf("Failed to kill dashboard command: %v", err)
-		}
-	}()
-
-	s, err := readLineWithTimeout(out, 180*time.Second)
-	if err != nil {
-		t.Fatalf("failed to read url: %v", err)
-	}
-
-	u, err := url.Parse(strings.TrimSpace(s))
-	if err != nil {
-		t.Fatalf("failed to parse %q: %v", s, err)
-	}
-
-	if u.Scheme != "http" {
-		t.Errorf("got Scheme %s, expected http", u.Scheme)
-	}
-	host, _, err := net.SplitHostPort(u.Host)
-	if err != nil {
-		t.Fatalf("failed SplitHostPort: %v", err)
-	}
-	if host != "127.0.0.1" {
-		t.Errorf("got host %s, expected 127.0.0.1", host)
-	}
-
-	resp, err := http.Get(u.String())
-	if err != nil {
-		t.Fatalf("failed get: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			t.Fatalf("Unable to read http response body: %v", err)
-		}
-		t.Errorf("%s returned status code %d, expected %d.\nbody:\n%s", u, resp.StatusCode, http.StatusOK, body)
-	}
-}
-
-func testIngressController(t *testing.T) {
-	t.Parallel()
-	minikubeRunner := NewMinikubeRunner(t)
-	kubectlRunner := util.NewKubectlRunner(t)
-
-	minikubeRunner.RunCommand("addons enable ingress", true)
-	if err := util.WaitForIngressControllerRunning(t); err != nil {
-		t.Fatalf("waiting for ingress-controller to be up: %v", err)
-	}
-
-	if err := util.WaitForIngressDefaultBackendRunning(t); err != nil {
-		t.Fatalf("waiting for default-http-backend to be up: %v", err)
-	}
-
-	ingressPath, _ := filepath.Abs("testdata/nginx-ing.yaml")
-	if _, err := kubectlRunner.RunCommand([]string{"create", "-f", ingressPath}); err != nil {
-		t.Fatalf("creating nginx ingress resource: %v", err)
-	}
-
-	podPath, _ := filepath.Abs("testdata/nginx-pod-svc.yaml")
-	if _, err := kubectlRunner.RunCommand([]string{"create", "-f", podPath}); err != nil {
-		t.Fatalf("creating nginx ingress resource: %v", err)
-	}
-
-	if err := util.WaitForNginxRunning(t); err != nil {
-		t.Fatalf("waiting for nginx to be up: %v", err)
-	}
-
-	checkIngress := func() error {
-		expectedStr := "Welcome to nginx!"
-		runCmd := fmt.Sprintf("curl http://127.0.0.1:80 -H 'Host: nginx.example.com'")
-		sshCmdOutput, _ := minikubeRunner.SSH(runCmd)
-		if !strings.Contains(sshCmdOutput, expectedStr) {
-			return fmt.Errorf("ExpectedStr sshCmdOutput to be: %s. Output was: %s", expectedStr, sshCmdOutput)
-		}
-		return nil
-	}
-
-	if err := util.Retry(t, checkIngress, 3*time.Second, 5); err != nil {
-		t.Fatalf(err.Error())
-	}
-
-	defer func() {
-		for _, p := range []string{podPath, ingressPath} {
-			if out, err := kubectlRunner.RunCommand([]string{"delete", "-f", p}); err != nil {
-				t.Logf("delete -f %s failed: %v\noutput: %s\n", p, err, out)
+		for _, tc := range tests {
+			tc := tc
+			if ctx.Err() == context.DeadlineExceeded {
+				t.Fatalf("Unable to run more tests (deadline exceeded)")
 			}
+			t.Run(tc.name, func(t *testing.T) {
+				MaybeParallel(t)
+				tc.validator(ctx, t, profile)
+			})
 		}
-	}()
-	minikubeRunner.RunCommand("addons disable ingress", true)
+	})
+
+	// Assert that disable/enable works offline
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "stop", "-p", profile))
+	if err != nil {
+		t.Errorf("failed to stop minikube. args %q : %v", rr.Command(), err)
+	}
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "addons", "enable", "dashboard", "-p", profile))
+	if err != nil {
+		t.Errorf("failed to enable dashboard addon: args %q : %v", rr.Command(), err)
+	}
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "addons", "disable", "dashboard", "-p", profile))
+	if err != nil {
+		t.Errorf("failed to disable dashboard addon: args %q : %v", rr.Command(), err)
+	}
 }
 
-func testServicesList(t *testing.T) {
-	t.Parallel()
-	minikubeRunner := NewMinikubeRunner(t)
+func validateIngressAddon(ctx context.Context, t *testing.T, profile string) {
+	defer PostMortemLogs(t, profile)
 
-	checkServices := func() error {
-		output := minikubeRunner.RunCommand("service list", false)
-		if !strings.Contains(output, "kubernetes") {
-			return fmt.Errorf("Error, kubernetes service missing from output %s", output)
+	if NoneDriver() || (runtime.GOOS == "darwin" && KicDriver()) {
+		t.Skipf("skipping: ssh unsupported by none")
+	}
+
+	client, err := kapi.Client(profile)
+	if err != nil {
+		t.Fatalf("failed to get Kubernetes client: %v", client)
+	}
+
+	if err := kapi.WaitForDeploymentToStabilize(client, "kube-system", "ingress-nginx-controller", Minutes(6)); err != nil {
+		t.Errorf("failed waiting for ingress-controller deployment to stabilize: %v", err)
+	}
+	if _, err := PodWait(ctx, t, profile, "kube-system", "app.kubernetes.io/name=ingress-nginx", Minutes(12)); err != nil {
+		t.Fatalf("failed waititing for nginx-ingress-controller : %v", err)
+	}
+
+	createIngress := func() error {
+		rr, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "replace", "--force", "-f", filepath.Join(*testdataDir, "nginx-ing.yaml")))
+		if err != nil {
+			return err
+		}
+		if rr.Stderr.String() != "" {
+			t.Logf("%v: unexpected stderr: %s (may be temproary)", rr.Command(), rr.Stderr)
 		}
 		return nil
 	}
-	if err := util.Retry(t, checkServices, 2*time.Second, 5); err != nil {
-		t.Fatalf(err.Error())
+
+	if err := retry.Expo(createIngress, 1*time.Second, Seconds(90)); err != nil {
+		t.Errorf("failed to create ingress: %v", err)
+	}
+
+	rr, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "replace", "--force", "-f", filepath.Join(*testdataDir, "nginx-pod-svc.yaml")))
+	if err != nil {
+		t.Errorf("failed to kubectl replace nginx-pod-svc. args %q. %v", rr.Command(), err)
+	}
+
+	if _, err := PodWait(ctx, t, profile, "default", "run=nginx", Minutes(4)); err != nil {
+		t.Fatalf("failed waiting for ngnix pod: %v", err)
+	}
+	if err := kapi.WaitForService(client, "default", "nginx", true, time.Millisecond*500, Minutes(10)); err != nil {
+		t.Errorf("failed waiting for nginx service to be up: %v", err)
+	}
+
+	want := "Welcome to nginx!"
+	addr := "http://127.0.0.1/"
+	checkIngress := func() error {
+		rr, err := Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "ssh", fmt.Sprintf("curl -s %s -H 'Host: nginx.example.com'", addr)))
+		if err != nil {
+			return err
+		}
+
+		stderr := rr.Stderr.String()
+		if rr.Stderr.String() != "" {
+			t.Logf("debug: unexpected stderr for %v:\n%s", rr.Command(), stderr)
+		}
+
+		stdout := rr.Stdout.String()
+		if !strings.Contains(stdout, want) {
+			return fmt.Errorf("%v stdout = %q, want %q", rr.Command(), stdout, want)
+		}
+		return nil
+	}
+
+	if err := retry.Expo(checkIngress, 500*time.Millisecond, Seconds(90)); err != nil {
+		t.Errorf("failed to get expected response from %s within minikube: %v", addr, err)
+	}
+
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "addons", "disable", "ingress", "--alsologtostderr", "-v=1"))
+	if err != nil {
+		t.Errorf("failed to disable ingress addon. args %q : %v", rr.Command(), err)
 	}
 }
 
-func testGvisor(t *testing.T) {
-	minikubeRunner := NewMinikubeRunner(t)
-	minikubeRunner.RunCommand("addons enable gvisor", true)
+func validateRegistryAddon(ctx context.Context, t *testing.T, profile string) {
+	defer PostMortemLogs(t, profile)
 
-	t.Log("waiting for gvisor controller to come up")
-	if err := util.WaitForGvisorControllerRunning(t); err != nil {
-		t.Fatalf("waiting for gvisor controller to be up: %v", err)
+	client, err := kapi.Client(profile)
+	if err != nil {
+		t.Fatalf("failed to get Kubernetes client for %s : %v", profile, err)
 	}
 
-	createUntrustedWorkload(t)
+	start := time.Now()
+	if err := kapi.WaitForRCToStabilize(client, "kube-system", "registry", Minutes(6)); err != nil {
+		t.Errorf("failed waiting for registry replicacontroller to stabilize: %v", err)
+	}
+	t.Logf("registry stabilized in %s", time.Since(start))
 
-	t.Log("making sure untrusted workload is Running")
-	if err := util.WaitForUntrustedNginxRunning(); err != nil {
-		t.Fatalf("waiting for nginx to be up: %v", err)
+	if _, err := PodWait(ctx, t, profile, "kube-system", "actual-registry=true", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for pod actual-registry: %v", err)
+	}
+	if _, err := PodWait(ctx, t, profile, "kube-system", "registry-proxy=true", Minutes(10)); err != nil {
+		t.Fatalf("failed waiting for pod registry-proxy: %v", err)
 	}
 
-	t.Log("disabling gvisor addon")
-	minikubeRunner.RunCommand("addons disable gvisor", true)
-	t.Log("waiting for gvisor controller pod to be deleted")
-	if err := util.WaitForGvisorControllerDeleted(); err != nil {
-		t.Fatalf("waiting for gvisor controller to be deleted: %v", err)
+	// Test from inside the cluster (no curl available on busybox)
+	rr, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "delete", "po", "-l", "run=registry-test", "--now"))
+	if err != nil {
+		t.Logf("pre-cleanup %s failed: %v (not a problem)", rr.Command(), err)
 	}
 
-	createUntrustedWorkload(t)
-
-	t.Log("waiting for FailedCreatePodSandBox event")
-	if err := util.WaitForFailedCreatePodSandBoxEvent(); err != nil {
-		t.Fatalf("waiting for FailedCreatePodSandBox event: %v", err)
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "run", "--rm", "registry-test", "--restart=Never", "--image=busybox", "-it", "--", "sh", "-c", "wget --spider -S http://registry.kube-system.svc.cluster.local"))
+	if err != nil {
+		t.Errorf("failed to hit registry.kube-system.svc.cluster.local. args %q failed: %v", rr.Command(), err)
 	}
-	deleteUntrustedWorkload(t)
+	want := "HTTP/1.1 200"
+	if !strings.Contains(rr.Stdout.String(), want) {
+		t.Errorf("expected curl response be %q, but got *%s*", want, rr.Stdout.String())
+	}
+
+	if NeedsPortForward() {
+		t.Skipf("Unable to complete rest of the test due to connectivity assumptions")
+	}
+
+	// Test from outside the cluster
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "ip"))
+	if err != nil {
+		t.Fatalf("failed run minikube ip. args %q : %v", rr.Command(), err)
+	}
+	if rr.Stderr.String() != "" {
+		t.Errorf("expected stderr to be -empty- but got: *%q* .  args %q", rr.Stderr, rr.Command())
+	}
+
+	endpoint := fmt.Sprintf("http://%s:%d", strings.TrimSpace(rr.Stdout.String()), 5000)
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		t.Fatalf("failed to parse %q: %v", endpoint, err)
+	}
+
+	checkExternalAccess := func() error {
+		resp, err := retryablehttp.Get(u.String())
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("%s = status code %d, want %d", u, resp.StatusCode, http.StatusOK)
+		}
+		return nil
+	}
+
+	if err := retry.Expo(checkExternalAccess, 500*time.Millisecond, Seconds(150)); err != nil {
+		t.Errorf("failed to check external access to %s: %v", u.String(), err.Error())
+	}
+
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "addons", "disable", "registry", "--alsologtostderr", "-v=1"))
+	if err != nil {
+		t.Errorf("failed to disable registry addon. args %q: %v", rr.Command(), err)
+	}
 }
 
-func testGvisorRestart(t *testing.T) {
-	minikubeRunner := NewMinikubeRunner(t)
-	minikubeRunner.EnsureRunning()
-	minikubeRunner.RunCommand("addons enable gvisor", true)
+func validateMetricsServerAddon(ctx context.Context, t *testing.T, profile string) {
+	defer PostMortemLogs(t, profile)
 
-	t.Log("waiting for gvisor controller to come up")
-	if err := util.WaitForGvisorControllerRunning(t); err != nil {
-		t.Fatalf("waiting for gvisor controller to be up: %v", err)
+	client, err := kapi.Client(profile)
+	if err != nil {
+		t.Fatalf("failed to get Kubernetes client for %s: %v", profile, err)
 	}
 
-	// TODO: @priyawadhwa to add test for stop as well
-	minikubeRunner.RunCommand("delete", false)
-	minikubeRunner.CheckStatus(state.None.String())
-	minikubeRunner.Start()
-	minikubeRunner.CheckStatus(state.Running.String())
+	start := time.Now()
+	if err := kapi.WaitForDeploymentToStabilize(client, "kube-system", "metrics-server", Minutes(6)); err != nil {
+		t.Errorf("failed waiting for metrics-server deployment to stabilize: %v", err)
+	}
+	t.Logf("metrics-server stabilized in %s", time.Since(start))
 
-	t.Log("waiting for gvisor controller to come up")
-	if err := util.WaitForGvisorControllerRunning(t); err != nil {
-		t.Fatalf("waiting for gvisor controller to be up: %v", err)
+	if _, err := PodWait(ctx, t, profile, "kube-system", "k8s-app=metrics-server", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for k8s-app=metrics-server pod: %v", err)
 	}
 
-	createUntrustedWorkload(t)
-	t.Log("making sure untrusted workload is Running")
-	if err := util.WaitForUntrustedNginxRunning(); err != nil {
-		t.Fatalf("waiting for nginx to be up: %v", err)
+	want := "CPU(cores)"
+	checkMetricsServer := func() error {
+		rr, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "top", "pods", "-n", "kube-system"))
+		if err != nil {
+			return err
+		}
+		if rr.Stderr.String() != "" {
+			t.Logf("%v: unexpected stderr: %s", rr.Command(), rr.Stderr)
+		}
+		if !strings.Contains(rr.Stdout.String(), want) {
+			return fmt.Errorf("%v stdout = %q, want %q", rr.Command(), rr.Stdout, want)
+		}
+		return nil
 	}
-	deleteUntrustedWorkload(t)
+
+	// metrics-server takes some time to be able to collect metrics
+	if err := retry.Expo(checkMetricsServer, time.Second*3, Minutes(6)); err != nil {
+		t.Errorf("failed checking metric server: %v", err.Error())
+	}
+
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "addons", "disable", "metrics-server", "--alsologtostderr", "-v=1"))
+	if err != nil {
+		t.Errorf("failed to disable metrics-server addon: args %q: %v", rr.Command(), err)
+	}
 }
 
-func createUntrustedWorkload(t *testing.T) {
-	kubectlRunner := util.NewKubectlRunner(t)
-	untrustedPath, _ := filepath.Abs("testdata/nginx-untrusted.yaml")
-	t.Log("creating pod with untrusted workload annotation")
-	if _, err := kubectlRunner.RunCommand([]string{"replace", "-f", untrustedPath, "--force"}); err != nil {
-		t.Fatalf("creating untrusted nginx resource: %v", err)
+func validateHelmTillerAddon(ctx context.Context, t *testing.T, profile string) {
+	defer PostMortemLogs(t, profile)
+
+	client, err := kapi.Client(profile)
+	if err != nil {
+		t.Fatalf("failed to get Kubernetes client for %s: %v", profile, err)
+	}
+
+	start := time.Now()
+	if err := kapi.WaitForDeploymentToStabilize(client, "kube-system", "tiller-deploy", Minutes(6)); err != nil {
+		t.Errorf("failed waiting for tiller-deploy deployment to stabilize: %v", err)
+	}
+	t.Logf("tiller-deploy stabilized in %s", time.Since(start))
+
+	if _, err := PodWait(ctx, t, profile, "kube-system", "app=helm", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for helm pod: %v", err)
+	}
+
+	if NoneDriver() {
+		_, err := exec.LookPath("socat")
+		if err != nil {
+			t.Skipf("socat is required by kubectl to complete this test")
+		}
+	}
+
+	want := "Server: &version.Version"
+	// Test from inside the cluster (`helm version` use pod.list permission. we use tiller serviceaccount in kube-system to list pod)
+	checkHelmTiller := func() error {
+
+		rr, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "run", "--rm", "helm-test", "--restart=Never", "--image=alpine/helm:2.16.3", "-it", "--namespace=kube-system", "--serviceaccount=tiller", "--", "version"))
+		if err != nil {
+			return err
+		}
+		if rr.Stderr.String() != "" {
+			t.Logf("%v: unexpected stderr: %s", rr.Command(), rr.Stderr)
+		}
+		if !strings.Contains(rr.Stdout.String(), want) {
+			return fmt.Errorf("%v stdout = %q, want %q", rr.Command(), rr.Stdout, want)
+		}
+		return nil
+	}
+
+	if err := retry.Expo(checkHelmTiller, 500*time.Millisecond, Minutes(2)); err != nil {
+		t.Errorf("failed checking helm tiller: %v", err.Error())
+	}
+
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "addons", "disable", "helm-tiller", "--alsologtostderr", "-v=1"))
+	if err != nil {
+		t.Errorf("failed disabling helm-tiller addon. arg %q.s %v", rr.Command(), err)
 	}
 }
 
-func deleteUntrustedWorkload(t *testing.T) {
-	kubectlRunner := util.NewKubectlRunner(t)
-	untrustedPath, _ := filepath.Abs("testdata/nginx-untrusted.yaml")
-	if _, err := kubectlRunner.RunCommand([]string{"delete", "-f", untrustedPath}); err != nil {
-		t.Logf("error deleting untrusted nginx resource: %v", err)
+func validateOlmAddon(ctx context.Context, t *testing.T, profile string) {
+	t.Skipf("Skipping olm test till this timeout issue is solved https://github.com/operator-framework/operator-lifecycle-manager/issues/1534#issuecomment-632342257")
+	defer PostMortemLogs(t, profile)
+
+	client, err := kapi.Client(profile)
+	if err != nil {
+		t.Fatalf("failed to get Kubernetes client for %s: %v", profile, err)
+	}
+
+	start := time.Now()
+	if err := kapi.WaitForDeploymentToStabilize(client, "olm", "catalog-operator", Minutes(6)); err != nil {
+		t.Errorf("failed waiting for catalog-operator deployment to stabilize: %v", err)
+	}
+	t.Logf("catalog-operator stabilized in %s", time.Since(start))
+	if err := kapi.WaitForDeploymentToStabilize(client, "olm", "olm-operator", Minutes(6)); err != nil {
+		t.Errorf("failed waiting for olm-operator deployment to stabilize: %v", err)
+	}
+	t.Logf("olm-operator stabilized in %s", time.Since(start))
+	if err := kapi.WaitForDeploymentToStabilize(client, "olm", "packageserver", Minutes(6)); err != nil {
+		t.Errorf("failed waiting for packageserver deployment to stabilize: %v", err)
+	}
+	t.Logf("packageserver stabilized in %s", time.Since(start))
+
+	if _, err := PodWait(ctx, t, profile, "olm", "app=catalog-operator", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for pod catalog-operator: %v", err)
+	}
+	if _, err := PodWait(ctx, t, profile, "olm", "app=olm-operator", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for pod olm-operator: %v", err)
+	}
+	if _, err := PodWait(ctx, t, profile, "olm", "app=packageserver", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for pod packageserver: %v", err)
+	}
+	if _, err := PodWait(ctx, t, profile, "olm", "olm.catalogSource=operatorhubio-catalog", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for pod operatorhubio-catalog: %v", err)
+	}
+
+	// Install one sample Operator such as etcd
+	rr, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "create", "-f", "https://operatorhub.io/install/etcd.yaml"))
+	if err != nil {
+		t.Logf("etcd operator installation with %s failed: %v", rr.Command(), err)
+	}
+
+	want := "Succeeded"
+	checkOperatorInstalled := func() error {
+		rr, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "get", "csv", "-n", "my-etcd"))
+		if err != nil {
+			return err
+		}
+		if rr.Stderr.String() != "" {
+			t.Logf("%v: unexpected stderr: %s", rr.Command(), rr.Stderr)
+		}
+		if !strings.Contains(rr.Stdout.String(), want) {
+			return fmt.Errorf("%v stdout = %q, want %q", rr.Command(), rr.Stdout, want)
+		}
+		return nil
+	}
+
+	// Operator installation takes a while
+	if err := retry.Expo(checkOperatorInstalled, time.Second*3, Minutes(6)); err != nil {
+		t.Errorf("failed checking operator installed: %v", err.Error())
+	}
+}
+
+func validateCSIDriverAndSnapshots(ctx context.Context, t *testing.T, profile string) {
+	defer PostMortemLogs(t, profile)
+
+	client, err := kapi.Client(profile)
+	if err != nil {
+		t.Fatalf("failed to get Kubernetes client for %s: %v", profile, err)
+	}
+
+	start := time.Now()
+	if err := kapi.WaitForPods(client, "kube-system", "kubernetes.io/minikube-addons=csi-hostpath-driver", Minutes(6)); err != nil {
+		t.Errorf("failed waiting for csi-hostpath-driver pods to stabilize: %v", err)
+	}
+	t.Logf("csi-hostpath-driver pods stabilized in %s", time.Since(start))
+
+	// create sample PVC
+	rr, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "create", "-f", filepath.Join(*testdataDir, "csi-hostpath-driver", "pvc.yaml")))
+	if err != nil {
+		t.Logf("creating sample PVC with %s failed: %v", rr.Command(), err)
+	}
+
+	if err := PVCWait(ctx, t, profile, "default", "hpvc", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for PVC hpvc: %v", err)
+	}
+
+	// create sample pod with the PVC
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "create", "-f", filepath.Join(*testdataDir, "csi-hostpath-driver", "pv-pod.yaml")))
+	if err != nil {
+		t.Logf("creating pod with %s failed: %v", rr.Command(), err)
+	}
+
+	if _, err := PodWait(ctx, t, profile, "default", "app=task-pv-pod", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for pod task-pv-pod: %v", err)
+	}
+
+	// create sample snapshotclass
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "create", "-f", filepath.Join(*testdataDir, "csi-hostpath-driver", "snapshotclass.yaml")))
+	if err != nil {
+		t.Logf("creating snapshostclass with %s failed: %v", rr.Command(), err)
+	}
+
+	// create volume snapshot
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "create", "-f", filepath.Join(*testdataDir, "csi-hostpath-driver", "snapshot.yaml")))
+	if err != nil {
+		t.Logf("creating pod with %s failed: %v", rr.Command(), err)
+	}
+
+	if err := VolumeSnapshotWait(ctx, t, profile, "default", "new-snapshot-demo", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for volume snapshot new-snapshot-demo: %v", err)
+	}
+
+	// delete pod
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "delete", "pod", "task-pv-pod"))
+	if err != nil {
+		t.Logf("deleting pod with %s failed: %v", rr.Command(), err)
+	}
+
+	// delete pvc
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "delete", "pvc", "hpvc"))
+	if err != nil {
+		t.Logf("deleting pod with %s failed: %v", rr.Command(), err)
+	}
+
+	// restore pv from snapshot
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "create", "-f", filepath.Join(*testdataDir, "csi-hostpath-driver", "pvc-restore.yaml")))
+	if err != nil {
+		t.Logf("creating pvc with %s failed: %v", rr.Command(), err)
+	}
+
+	if err = PVCWait(ctx, t, profile, "default", "hpvc-restore", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for PVC hpvc-restore: %v", err)
+	}
+
+	// create pod from restored snapshot
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "create", "-f", filepath.Join(*testdataDir, "csi-hostpath-driver", "pv-pod-restore.yaml")))
+	if err != nil {
+		t.Logf("creating pod with %s failed: %v", rr.Command(), err)
+	}
+
+	if _, err := PodWait(ctx, t, profile, "default", "app=task-pv-pod-restore", Minutes(6)); err != nil {
+		t.Fatalf("failed waiting for pod task-pv-pod-restore: %v", err)
+	}
+
+	// CLEANUP
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "delete", "pod", "task-pv-pod-restore"))
+	if err != nil {
+		t.Logf("cleanup with %s failed: %v", rr.Command(), err)
+	}
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "delete", "pvc", "hpvc-restore"))
+	if err != nil {
+		t.Logf("cleanup with %s failed: %v", rr.Command(), err)
+	}
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "delete", "volumesnapshot", "new-snapshot-demo"))
+	if err != nil {
+		t.Logf("cleanup with %s failed: %v", rr.Command(), err)
+	}
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "addons", "disable", "csi-hostpath-driver", "--alsologtostderr", "-v=1"))
+	if err != nil {
+		t.Errorf("failed to disable csi-hostpath-driver addon: args %q: %v", rr.Command(), err)
+	}
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "addons", "disable", "volumesnapshots", "--alsologtostderr", "-v=1"))
+	if err != nil {
+		t.Errorf("failed to disable volumesnapshots addon: args %q: %v", rr.Command(), err)
+	}
+}
+
+func validateGCPAuthAddon(ctx context.Context, t *testing.T, profile string) {
+	defer PostMortemLogs(t, profile)
+
+	// schedule a pod to check environment variables
+	rr, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "create", "-f", filepath.Join(*testdataDir, "busybox.yaml")))
+	if err != nil {
+		t.Fatalf("%s failed: %v", rr.Command(), err)
+	}
+
+	// 8 minutes, because 4 is not enough for images to pull in all cases.
+	names, err := PodWait(ctx, t, profile, "default", "integration-test=busybox", Minutes(8))
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+
+	// Use this pod to confirm that the env vars are set correctly
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "exec", names[0], "--", "/bin/sh", "-c", "printenv GOOGLE_APPLICATION_CREDENTIALS"))
+	if err != nil {
+		t.Fatalf("printenv creds: %v", err)
+	}
+
+	got := strings.TrimSpace(rr.Stdout.String())
+	expected := "/google-app-creds.json"
+	if got != expected {
+		t.Errorf("'printenv GOOGLE_APPLICATION_CREDENTIALS' returned %s, expected %s", got, expected)
+	}
+
+	// Make sure the file contents are correct
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "exec", names[0], "--", "/bin/sh", "-c", "cat /google-app-creds.json"))
+	if err != nil {
+		t.Fatalf("cat creds: %v", err)
+	}
+
+	var gotJSON map[string]string
+	err = json.Unmarshal(bytes.TrimSpace(rr.Stdout.Bytes()), &gotJSON)
+	if err != nil {
+		t.Fatalf("unmarshal json: %v", err)
+	}
+	expectedJSON := map[string]string{
+		"client_id":        "haha",
+		"client_secret":    "nice_try",
+		"quota_project_id": "this_is_fake",
+		"refresh_token":    "maybe_next_time",
+		"type":             "authorized_user",
+	}
+
+	if !reflect.DeepEqual(gotJSON, expectedJSON) {
+		t.Fatalf("unexpected creds file: got %v, expected %v", gotJSON, expectedJSON)
+	}
+
+	// Check the GOOGLE_CLOUD_PROJECT env var as well
+	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "exec", names[0], "--", "/bin/sh", "-c", "printenv GOOGLE_CLOUD_PROJECT"))
+	if err != nil {
+		t.Fatalf("print env project: %v", err)
+	}
+
+	got = strings.TrimSpace(rr.Stdout.String())
+	expected = "this_is_fake"
+	if got != expected {
+		t.Errorf("'printenv GOOGLE_APPLICATION_CREDENTIALS' returned %s, expected %s", got, expected)
+	}
+
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "addons", "disable", "gcp-auth", "--alsologtostderr", "-v=1"))
+	if err != nil {
+		t.Errorf("failed disabling gcp-auth addon. arg %q.s %v", rr.Command(), err)
 	}
 }

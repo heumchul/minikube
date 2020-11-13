@@ -18,17 +18,11 @@ package config
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 
-	"github.com/pkg/errors"
-	"k8s.io/minikube/pkg/minikube/assets"
-	"k8s.io/minikube/pkg/minikube/cluster"
 	"k8s.io/minikube/pkg/minikube/config"
-	"k8s.io/minikube/pkg/minikube/constants"
-	"k8s.io/minikube/pkg/minikube/machine"
-	"k8s.io/minikube/pkg/minikube/storageclass"
+	"k8s.io/minikube/pkg/minikube/out"
 )
 
 // Runs all the validation or callback functions and collects errors
@@ -52,21 +46,24 @@ func findSetting(name string) (Setting, error) {
 			return s, nil
 		}
 	}
-	return Setting{}, fmt.Errorf("Property name %s not found", name)
+	return Setting{}, fmt.Errorf("property name %q not found", name)
 }
 
 // Set Functions
 
+// SetString sets a string value
 func SetString(m config.MinikubeConfig, name string, val string) error {
 	m[name] = val
 	return nil
 }
 
+// SetMap sets a map value
 func SetMap(m config.MinikubeConfig, name string, val map[string]interface{}) error {
 	m[name] = val
 	return nil
 }
 
+// SetConfigMap sets a config map value
 func SetConfigMap(m config.MinikubeConfig, name string, val string) error {
 	list := strings.Split(val, ",")
 	v := make(map[string]interface{})
@@ -77,6 +74,7 @@ func SetConfigMap(m config.MinikubeConfig, name string, val string) error {
 	return nil
 }
 
+// SetInt sets an int value
 func SetInt(m config.MinikubeConfig, name string, val string) error {
 	i, err := strconv.Atoi(val)
 	if err != nil {
@@ -86,6 +84,7 @@ func SetInt(m config.MinikubeConfig, name string, val string) error {
 	return nil
 }
 
+// SetBool sets a bool value
 func SetBool(m config.MinikubeConfig, name string, val string) error {
 	b, err := strconv.ParseBool(val)
 	if err != nil {
@@ -95,71 +94,41 @@ func SetBool(m config.MinikubeConfig, name string, val string) error {
 	return nil
 }
 
-// EnableOrDisableAddon updates addon status executing any commands necessary
-func EnableOrDisableAddon(name string, val string) error {
-	enable, err := strconv.ParseBool(val)
-	if err != nil {
-		return errors.Wrapf(err, "parsing bool: %s", name)
-	}
-
-	//TODO(r2d4): config package should not reference API, pull this out
-	api, err := machine.NewAPIClient()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting client: %v\n", err)
-		os.Exit(1)
-	}
-	defer api.Close()
-	cluster.EnsureMinikubeRunningOrExit(api, 0)
-
-	addon := assets.Addons[name]
-	host, err := cluster.CheckIfHostExistsAndLoad(api, config.GetMachineName())
-	if err != nil {
-		return errors.Wrap(err, "getting host")
-	}
-	cmd, err := machine.CommandRunner(host)
-	if err != nil {
-		return errors.Wrap(err, "command runner")
-	}
-	if enable {
-		for _, addon := range addon.Assets {
-			if err := cmd.Copy(addon); err != nil {
-				return errors.Wrapf(err, "enabling addon %s", addon.AssetName)
-			}
-		}
-	} else {
-		for _, addon := range addon.Assets {
-			if err := cmd.Remove(addon); err != nil {
-				return errors.Wrapf(err, "disabling addon %s", addon.AssetName)
-			}
-		}
-	}
-	return nil
+// ErrValidateProfile Error to validate profile
+type ErrValidateProfile struct {
+	Name string
+	Msg  string
 }
 
-func EnableOrDisableStorageClasses(name, val string) error {
-	enable, err := strconv.ParseBool(val)
+func (e ErrValidateProfile) Error() string {
+	return e.Msg
+}
+
+// ValidateProfile checks if the profile user is trying to switch exists, else throws error
+func ValidateProfile(profile string) (*ErrValidateProfile, bool) {
+
+	validProfiles, invalidProfiles, err := config.ListProfiles()
 	if err != nil {
-		return errors.Wrap(err, "Error parsing boolean")
+		out.FailureT(err.Error())
 	}
 
-	class := constants.DefaultStorageClassProvisioner
-	if name == "storage-provisioner-gluster" {
-		class = "glusterfile"
-	}
-
-	if enable {
-		// Only StorageClass for 'name' should be marked as default
-		err := storageclass.SetDefaultStorageClass(class)
-		if err != nil {
-			return errors.Wrapf(err, "Error making %s the default storage class", class)
-		}
-	} else {
-		// Unset the StorageClass as default
-		err := storageclass.DisableDefaultStorageClass(class)
-		if err != nil {
-			return errors.Wrapf(err, "Error disabling %s as the default storage class", class)
+	// handling invalid profiles
+	for _, invalidProf := range invalidProfiles {
+		if profile == invalidProf.Name {
+			return &ErrValidateProfile{Name: profile, Msg: fmt.Sprintf("%q is an invalid profile", profile)}, false
 		}
 	}
 
-	return EnableOrDisableAddon(name, val)
+	profileFound := false
+	// valid profiles if found, setting profileFound to trueexpectedMsg
+	for _, prof := range validProfiles {
+		if prof.Name == profile {
+			profileFound = true
+			break
+		}
+	}
+	if !profileFound {
+		return &ErrValidateProfile{Name: profile, Msg: fmt.Sprintf("profile %q not found", profile)}, false
+	}
+	return nil, true
 }

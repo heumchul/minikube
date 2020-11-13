@@ -24,16 +24,12 @@ import (
 
 // These constants are used by both minikube
 const (
-	APIServerPort            = 8443
-	DefaultMinikubeDirectory = "/var/lib/minikube"
-	DefaultCertPath          = DefaultMinikubeDirectory + "/certs/"
-	DefaultKubeConfigPath    = DefaultMinikubeDirectory + "/kubeconfig"
-	DefaultDNSDomain         = "cluster.local"
-	DefaultServiceCIDR       = "10.96.0.0/12"
+	APIServerPort    = 8443
+	DefaultDNSDomain = "cluster.local"
 )
 
-var DefaultAdmissionControllers = []string{
-	"Initializers",
+// DefaultV114AdmissionControllers are admission controllers we default to in v1.14.x
+var DefaultV114AdmissionControllers = []string{
 	"NamespaceLifecycle",
 	"LimitRanger",
 	"ServiceAccount",
@@ -44,6 +40,9 @@ var DefaultAdmissionControllers = []string{
 	"ValidatingAdmissionWebhook",
 	"ResourceQuota",
 }
+
+// DefaultLegacyAdmissionControllers are admission controllers we include with Kubernetes <1.14.0
+var DefaultLegacyAdmissionControllers = append([]string{"Initializers"}, DefaultV114AdmissionControllers...)
 
 // GetServiceClusterIP returns the first IP of the ServiceCIDR
 func GetServiceClusterIP(serviceCIDR string) (net.IP, error) {
@@ -67,6 +66,7 @@ func GetDNSIP(serviceCIDR string) (net.IP, error) {
 	return ip, nil
 }
 
+// GetAlternateDNS returns a list of alternate names for a domain
 func GetAlternateDNS(domain string) []string {
 	return []string{"kubernetes.default.svc." + domain, "kubernetes.default.svc", "kubernetes.default", "kubernetes", "localhost"}
 }

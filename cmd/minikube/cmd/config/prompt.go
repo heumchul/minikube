@@ -18,13 +18,14 @@ package config
 
 import (
 	"bufio"
-	"fmt"
 	"io"
 	"log"
 	"os"
 	"strings"
 
 	"golang.org/x/crypto/ssh/terminal"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/minikube/out"
 )
 
 // AskForYesNoConfirmation asks the user for confirmation. A user must type in "yes" or "no" and
@@ -35,22 +36,20 @@ func AskForYesNoConfirmation(s string, posResponses, negResponses []string) bool
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
-		fmt.Printf("%s [y/n]: ", s)
+		out.String("%s [y/n]: ", s)
 
 		response, err := reader.ReadString('\n')
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		response = strings.ToLower(strings.TrimSpace(response))
-
-		if containsString(posResponses, response) {
+		switch r := strings.ToLower(strings.TrimSpace(response)); {
+		case containsString(posResponses, r):
 			return true
-		} else if containsString(negResponses, response) {
+		case containsString(negResponses, r):
 			return false
-		} else {
-			fmt.Println("Please type yes or no:")
-			return AskForYesNoConfirmation(s, posResponses, negResponses)
+		default:
+			out.Err("Please type yes or no:")
 		}
 	}
 }
@@ -64,7 +63,7 @@ func AskForStaticValue(s string) string {
 
 		// Can't have zero length
 		if len(response) == 0 {
-			fmt.Println("--Error, please enter a value:")
+			out.Err("--Error, please enter a value:")
 			continue
 		}
 		return response
@@ -79,7 +78,7 @@ func AskForStaticValueOptional(s string) string {
 }
 
 func getStaticValue(reader *bufio.Reader, s string) string {
-	fmt.Printf("%s", s)
+	out.String("%s", s)
 
 	response, err := reader.ReadString('\n')
 	if err != nil {
@@ -111,13 +110,14 @@ func concealableAskForStaticValue(readWriter io.ReadWriter, promptString string,
 		}
 		response = strings.TrimSpace(response)
 		if len(response) == 0 {
-			fmt.Println("--Error, please enter a value:")
-			return concealableAskForStaticValue(readWriter, promptString, hidden)
+			out.WarningT("Please enter a value:")
+			continue
 		}
 		return response, nil
 	}
 }
 
+// AskForPasswordValue asks for a password value, while hiding the input
 func AskForPasswordValue(s string) string {
 
 	stdInFd := int(os.Stdin.Fd())
@@ -125,7 +125,11 @@ func AskForPasswordValue(s string) string {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer terminal.Restore(stdInFd, oldState)
+	defer func() {
+		if err := terminal.Restore(stdInFd, oldState); err != nil {
+			klog.Errorf("terminal restore failed: %v", err)
+		}
+	}()
 
 	result, err := concealableAskForStaticValue(os.Stdin, s, true)
 	if err != nil {
@@ -145,7 +149,27 @@ func posString(slice []string, element string) int {
 	return -1
 }
 
-// containsString returns true iff slice contains element
+// containsString returns true if slice contains element
 func containsString(slice []string, element string) bool {
-	return !(posString(slice, element) == -1)
+	return posString(slice, element) != -1
+}
+
+// AskForStaticValidatedValue asks for a single value to enter and check for valid input
+func AskForStaticValidatedValue(s string, validator func(s string) bool) string {
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		response := getStaticValue(reader, s)
+
+		// Can't have zero length
+		if len(response) == 0 {
+			out.Err("--Error, please enter a value:")
+			continue
+		}
+		if !validator(response) {
+			out.Err("--Invalid input, please enter a value:")
+			continue
+		}
+		return response
+	}
 }

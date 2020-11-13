@@ -17,16 +17,17 @@ limitations under the License.
 package tunnel
 
 import (
+	"path/filepath"
 	"time"
 
 	"context"
 	"fmt"
 
 	"github.com/docker/machine/libmachine"
-	"github.com/golang/glog"
-	"k8s.io/client-go/kubernetes/typed/core/v1"
+	typed_core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/config"
-	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/minikube/localpath"
 )
 
 // Manager can create, start and cleanup a tunnel
@@ -38,19 +39,27 @@ type Manager struct {
 	router   router
 }
 
-//stateCheckInterval defines how frequently the cluster and route states are checked
+// stateCheckInterval defines how frequently the cluster and route states are checked
 const stateCheckInterval = 5 * time.Second
 
+// RegistryPath returns the path to the runnel registry file
+func RegistryPath() string {
+	return filepath.Join(localpath.MiniPath(), "tunnels.json")
+}
+
+// NewManager creates a new Manager
 func NewManager() *Manager {
 	return &Manager{
 		delay: stateCheckInterval,
 		registry: &persistentRegistry{
-			path: constants.TunnelRegistryPath(),
+			path: RegistryPath(),
 		},
 		router: &osRouter{},
 	}
 }
-func (mgr *Manager) StartTunnel(ctx context.Context, machineName string, machineAPI libmachine.API, configLoader config.Loader, v1Core v1.CoreV1Interface) (done chan bool, err error) {
+
+// StartTunnel starts the tunnel
+func (mgr *Manager) StartTunnel(ctx context.Context, machineName string, machineAPI libmachine.API, configLoader config.Loader, v1Core typed_core.CoreV1Interface) (done chan bool, err error) {
 	tunnel, err := newTunnel(machineName, machineAPI, configLoader, v1Core, mgr.registry, mgr.router)
 	if err != nil {
 		return nil, fmt.Errorf("error creating tunnel: %s", err)
@@ -59,25 +68,25 @@ func (mgr *Manager) StartTunnel(ctx context.Context, machineName string, machine
 
 }
 func (mgr *Manager) startTunnel(ctx context.Context, tunnel controller) (done chan bool, err error) {
-	glog.Info("Setting up tunnel...")
+	klog.Info("Setting up tunnel...")
 
 	ready := make(chan bool, 1)
 	check := make(chan bool, 1)
 	done = make(chan bool, 1)
 
-	//simulating Ctrl+C so that we can cancel the tunnel programmatically too
+	// simulating Ctrl+C so that we can cancel the tunnel programmatically too
 	go mgr.timerLoop(ready, check)
 	go mgr.run(ctx, tunnel, ready, check, done)
 
-	glog.Info("Started minikube tunnel.")
+	klog.Info("Started minikube tunnel.")
 	return
 }
 
 func (mgr *Manager) timerLoop(ready, check chan bool) {
 	for {
-		glog.V(4).Info("waiting for tunnel to be ready for next check")
+		klog.V(4).Info("waiting for tunnel to be ready for next check")
 		<-ready
-		glog.V(4).Infof("sleep for %s", mgr.delay)
+		klog.V(4).Infof("sleep for %s", mgr.delay)
 		time.Sleep(mgr.delay)
 		check <- true
 	}
@@ -94,7 +103,7 @@ func (mgr *Manager) run(ctx context.Context, t controller, ready, check, done ch
 			mgr.cleanup(t)
 			return
 		case <-check:
-			glog.V(4).Info("check received")
+			klog.V(4).Info("check received")
 			select {
 			case <-ctx.Done():
 				mgr.cleanup(t)
@@ -102,9 +111,9 @@ func (mgr *Manager) run(ctx context.Context, t controller, ready, check, done ch
 			default:
 			}
 			status := t.update()
-			glog.V(4).Infof("minikube status: %s", status)
+			klog.V(4).Infof("minikube status: %s", status)
 			if status.MinikubeState != Running {
-				glog.Infof("minikube status: %s, cleaning up and quitting...", status.MinikubeState)
+				klog.Infof("minikube status: %s, cleaning up and quitting...", status.MinikubeState)
 				mgr.cleanup(t)
 				return
 			}
@@ -113,10 +122,11 @@ func (mgr *Manager) run(ctx context.Context, t controller, ready, check, done ch
 	}
 }
 
-func (mgr *Manager) cleanup(t controller) *Status {
-	return t.cleanup()
+func (mgr *Manager) cleanup(t controller) {
+	t.cleanup()
 }
 
+// CleanupNotRunningTunnels cleans up tunnels that are not running
 func (mgr *Manager) CleanupNotRunningTunnels() error {
 	tunnels, err := mgr.registry.List()
 	if err != nil {
@@ -125,7 +135,7 @@ func (mgr *Manager) CleanupNotRunningTunnels() error {
 
 	for _, tunnel := range tunnels {
 		isRunning, err := checkIfRunning(tunnel.Pid)
-		glog.Infof("%v is running: %t", tunnel, isRunning)
+		klog.Infof("%v is running: %t", tunnel, isRunning)
 		if err != nil {
 			return fmt.Errorf("error checking if tunnel is running: %s", err)
 		}

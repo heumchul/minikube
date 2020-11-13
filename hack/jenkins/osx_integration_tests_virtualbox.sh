@@ -15,7 +15,7 @@
 # limitations under the License.
 
 
-# This script runs the integration tests on an OSX machine for the Virtualbox Driver
+# This script runs the integration tests on an macOS machine for the VirtualBox Driver
 
 # The script expects the following env variables:
 # MINIKUBE_LOCATION: GIT_COMMIT from upstream build.
@@ -27,8 +27,16 @@
 set -e
 OS_ARCH="darwin-amd64"
 VM_DRIVER="virtualbox"
-JOB_NAME="OSX-Virtualbox"
+JOB_NAME="VirtualBox_macOS"
 EXTRA_ARGS="--bootstrapper=kubeadm"
+# hyperkit behaves better, so it has higher precedence.
+# Assumes that hyperkit is also installed on the VirtualBox CI host.
+EXPECTED_DEFAULT_DRIVER="hyperkit"
 
-# Download files and set permissions
+
+mkdir -p cron && gsutil -qm rsync "gs://minikube-builds/${MINIKUBE_LOCATION}/cron" cron || echo "FAILED TO GET CRON FILES"
+install cron/cleanup_and_reboot_Darwin.sh $HOME/cleanup_and_reboot.sh  || echo "FAILED TO GET INSTALL CLEANUP"
+echo "*/30 * * * * $HOME/cleanup_and_reboot.sh" | crontab
+crontab -l
+
 source common.sh

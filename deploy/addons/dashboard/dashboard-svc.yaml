@@ -1,5 +1,4 @@
-
-# Copyright 2016 The Kubernetes Authors All rights reserved.
+# Copyright 2017 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,19 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 kind: Service
 apiVersion: v1
 metadata:
-  name: kubernetes-dashboard
-  namespace: kube-system
   labels:
-    app: kubernetes-dashboard
-    addonmanager.kubernetes.io/mode: Reconcile
+    k8s-app: kubernetes-dashboard
     kubernetes.io/minikube-addons: dashboard
-    kubernetes.io/minikube-addons-endpoint: dashboard
+    addonmanager.kubernetes.io/mode: Reconcile    
+  name: kubernetes-dashboard
+  namespace: kubernetes-dashboard
 spec:
   ports:
-  - port: 80
-    targetPort: 9090
+    - port: 80
+      targetPort: 9090
   selector:
-    app: kubernetes-dashboard
+    k8s-app: kubernetes-dashboard
+
+---
+
+kind: Service
+apiVersion: v1
+metadata:
+  labels:
+    k8s-app: dashboard-metrics-scraper
+    kubernetes.io/minikube-addons: dashboard
+    addonmanager.kubernetes.io/mode: Reconcile    
+  name: dashboard-metrics-scraper
+  namespace: kubernetes-dashboard
+spec:
+  ports:
+    - port: 8000
+      targetPort: 8000
+  selector:
+    k8s-app: dashboard-metrics-scraper

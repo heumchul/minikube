@@ -17,35 +17,48 @@ limitations under the License.
 package bootstrapper
 
 import (
-	"io"
-	"net"
+	"time"
 
+	"k8s.io/minikube/pkg/minikube/bootstrapper/images"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/minikube/cruntime"
 )
 
-// Bootstrapper contains all the methods needed to bootstrap a kubernetes cluster
+// LogOptions are options to be passed to LogCommands
+type LogOptions struct {
+	// Lines is the number of recent log lines to include, as in tail -n.
+	Lines int
+	// Follow is whether or not to actively follow the logs, as in tail -f.
+	Follow bool
+}
+
+// Bootstrapper contains all the methods needed to bootstrap a Kubernetes cluster
 type Bootstrapper interface {
-	// PullImages pulls images necessary for a cluster. Success should not be required.
-	PullImages(config.KubernetesConfig) error
-	StartCluster(config.KubernetesConfig) error
-	UpdateCluster(config.KubernetesConfig) error
-	RestartCluster(config.KubernetesConfig) error
-	GetClusterLogsTo(follow bool, out io.Writer) error
-	SetupCerts(cfg config.KubernetesConfig) error
-	GetKubeletStatus() (string, error)
-	GetApiServerStatus(net.IP) (string, error)
+	StartCluster(config.ClusterConfig) error
+	UpdateCluster(config.ClusterConfig) error
+	DeleteCluster(config.KubernetesConfig) error
+	WaitForNode(config.ClusterConfig, config.Node, time.Duration) error
+	JoinCluster(config.ClusterConfig, config.Node, string) error
+	UpdateNode(config.ClusterConfig, config.Node, cruntime.Manager) error
+	GenerateToken(config.ClusterConfig) (string, error)
+	// LogCommands returns a map of log type to a command which will display that log.
+	LogCommands(config.ClusterConfig, LogOptions) map[string]string
+	SetupCerts(config.KubernetesConfig, config.Node) error
+	GetAPIServerStatus(string, int) (string, error)
 }
 
 const (
-	BootstrapperTypeKubeadm = "kubeadm"
+	// Kubeadm is the kubeadm bootstrapper type
+	Kubeadm = "kubeadm"
 )
 
-func GetCachedImageList(version string, bootstrapper string) []string {
-	switch bootstrapper {
-	case BootstrapperTypeKubeadm:
-		return constants.GetKubeadmCachedImages(version)
-	default:
-		return []string{}
-	}
+// GetCachedBinaryList returns the list of binaries
+func GetCachedBinaryList(bootstrapper string) []string {
+	return constants.KubernetesReleaseBinaries
+}
+
+// GetCachedImageList returns the list of images for a version
+func GetCachedImageList(imageRepository string, version string, bootstrapper string) ([]string, error) {
+	return images.Kubeadm(imageRepository, version)
 }
